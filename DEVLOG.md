@@ -301,3 +301,75 @@ proprietary stack — only for `nouveau`, the open driver, which isn't what's ru
 wall holds regardless of which correct device node it's pointed at. Tier 2 (understanding
 `waydroid-nvidia`'s Venus-proxy architecture, and specifically whether its Wayland-compositor
 requirement is structural or incidental) is next.
+
+## 2026-09-22 (same day) — Tier 2: the Wayland requirement is confirmed incidental, and a correction to Tier 1's "nothing to reuse"
+
+Read `waydroid-nvidia`'s own `docs/architecture.md` directly rather than inferring from the
+README's prose. Two outcomes, one of them a real correction to what got written a few hours ago.
+
+**The Wayland/KWin requirement is exactly as incidental as hoped, confirmed by reading the actual
+pipeline, not just the marketing description:**
+
+```
+Android app ── Vulkan ──▶ guest Mesa Venus (bionic, vulkan.virtio.so)
+                              │ Venus protocol over vtest unix socket
+                              ▼
+                     virglrenderer render server (host)
+                              │ real Vulkan
+                              ▼
+                     NVIDIA proprietary driver ──▶ GPU
+                              │ VkImage (block-linear) ─exported▶ dmabuf
+                              ▼
+       guest gralloc (minigbm vtest backend) imports the dmabuf
+                              │
+                     hwcomposer.waydroid ──▶ Wayland ──▶ KWin
+```
+
+The entire rendering path — guest Venus driver, unix-socket transport, **`virglrenderer`**
+(a standalone host process, not KWin) issuing real Vulkan calls against NVIDIA, buffers coming
+back as dmabufs — completes with zero involvement from Wayland or KWin. Wayland only shows up in
+the *last* arrow, and it's `hwcomposer.waydroid` specifically — Waydroid's own hwcomposer HAL,
+written to hand composited frames to a Wayland surface so they appear as a window on the host
+desktop — that requires it, not the rendering pipeline itself. The doc's own "why host-side
+allocation" section confirms this framing explicitly: the reason buffers must be NVIDIA-native
+block-linear is "on a machine whose displays are on the NVIDIA GPU, **KWin** composites on
+NVIDIA" — a display-time constraint, not a rendering-time one.
+
+This matters directly for redroid: redroid already has its own hwcomposer HAL
+(`vendor.hwcomposer-2-1`, already running today, headless by construction — redroid has never
+needed a physical display or a compositor to produce a frame buffer). Nothing about this project
+needs `hwcomposer.waydroid`, Wayland, or KWin at all — only the guest-Venus / host-virglrenderer /
+gralloc-import chain above it, feeding into redroid's *own*, already-headless hwcomposer instead.
+
+**Correction to this same day's earlier Tier 1 entry:** "nothing to reuse" was too strong.
+Searched the actual redroid vendor partition (not just `gpu_config.sh`'s logic) for virtio-gpu/
+Venus artifacts and found real ones, already shipped, currently dormant:
+
+```
+/vendor/lib64/hw/vulkan.virtio.so     — the exact guest Venus Vulkan driver
+/vendor/lib64/dri/virtio_gpu_dri.so   — Mesa's virtio-gpu Gallium/DRI driver
+```
+
+`gpu_config.sh` even has a `virtio_gpu` case already (`setprop ro.hardware.vulkan virtio`) — it's
+just never reached, because nothing on these test hosts registers a `virtio_gpu` DRI node (redroid
+does GPU passthrough via a direct `/dev/dri` bind-mount, not a paravirtualized virtio-gpu device,
+so the auto-detect loop never finds one to trigger it). The driver being *present* doesn't mean
+the *host-forwarding infrastructure* is present — no `virglrenderer` process, no vtest socket, no
+patched minigbm vtest allocation backend exist anywhere in this stack yet — so Tier 1's core
+conclusion stands (nothing *wired up and working* to reuse), but "nothing to reuse *at all*" was
+inaccurate. The real, corrected picture: the guest half of this bridge is already sitting in the
+image; what's missing is everything on the host side, plus (per waydroid-nvidia's own component
+map) a real, non-trivial patch to minigbm — their `gbm_mesa_driver/vtest_wrapper.c` is described
+as "net-new," i.e. stock minigbm doesn't support vtest-based GPU allocation without it.
+
+**Where this leaves it:** the plan is real and considerably narrower than "port Waydroid's whole
+NVIDIA stack." What's actually needed: (1) a host-side `virglrenderer` process running in
+vtest/venus mode against the real NVIDIA driver — the project's own patches to `virglrenderer`'s
+`vtest/`/`src/venus/` are exactly this piece, (2) redroid's guest props set manually
+(`ro.hardware.vulkan=virtio`, `ro.hardware.egl=angle`, `mesa.vn.debug=vtest`,
+`mesa.vtest.socket.name=/dev/venus.sock`) instead of relying on the driver-name auto-detect loop,
+and (3) minigbm's vtest allocation wrapper, ported from their fork since stock minigbm doesn't
+have it. None of it touches Wayland, KWin, or `hwcomposer.waydroid` — redroid keeps its own,
+already-headless display path throughout. Tier 3 (minimal headless host-side renderer prototype)
+is next: get a bare `virglrenderer` vtest/venus server talking to the real NVIDIA driver, confirmed
+working standalone, before wiring anything into redroid's boot process at all.

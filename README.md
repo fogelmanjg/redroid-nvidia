@@ -14,12 +14,11 @@ rendering via Mesa) already works on AMD/Intel, so the work was specifically abo
 
 NVIDIA doesn't have that foundation yet. As of today:
 
-- **`gpuMode=host` doesn't boot on NVIDIA.** SurfaceFlinger crashes (`SIGABRT` in
-  `SkiaGLRenderEngine::chooseEglConfig`) — a real EGL config negotiation failure between whatever
-  gralloc redroid falls back to and NVIDIA's proprietary EGL/GL stack. redroid's own vendor
-  gralloc (`gralloc.redroid.so`, built around Mesa/GBM assumptions) isn't even the one in play —
-  Mesa's own client library falls back to a generic implementation first, and that's what fails to
-  agree on a config with NVIDIA.
+- **`gpuMode=host` doesn't boot on NVIDIA.** With driver capabilities correctly set (see below),
+  `gralloc.redroid.so` (Mesa's GBM, built against Android's bionic libc) genuinely runs but fails
+  at `gbm_create_device()` with `EINVAL` — it has no driver-table entry for NVIDIA's proprietary
+  stack, only for `nouveau`. A real cross-libc/cross-namespace wall, not a config gap — see the
+  findings below and the roadmap's Tier 0/1.
 - **`gpuMode=guest` (pure software rendering) does work** as a fallback — confirmed booting clean
   in ~14s — but that's no acceleration at all, not a fix.
 - **Hardware video encode can't reuse redroid-hwenc's approach at all.** `nvidia-vaapi-driver` is
@@ -67,18 +66,19 @@ Real findings from initial investigation, carried over so this doesn't start fro
   signature — inconclusive as a real test, since Android's `platform_android` EGL backend likely
   doesn't honor those particular override points the same way a normal desktop Mesa app would.
   Worth revisiting with a more precise override point if this route comes back.
-- **Prior art exists and actually works, but doesn't fit this project's constraints**:
+- **Prior art exists and fits better than first thought**:
   [waydroid-nvidia](https://github.com/Shiro836/waydroid-nvidia) gets real GPU-accelerated
   Android-in-container on NVIDIA working (verified: Minecraft Bedrock, 2ms present-to-present
   latency). Its approach — proxy Vulkan (Mesa Venus) from the Android guest over a Unix socket to a
-  host-side renderer, allocate buffers host-side as native NVIDIA images, hand them to the consumer
-  as NVIDIA dmabufs — sidesteps the cross-vendor EGL/gralloc negotiation problem entirely, which is
-  exactly the class of bug hit here. **The catch**: it requires a real Wayland compositor already
-  running on the host (verified against KWin/Plasma) — the Android container renders *through*
-  that existing desktop session. That's the opposite of headless operation, which matters for
-  running this on a bare server with nothing but Docker. Porting the approach as-is would mean
-  giving up headless operation specifically on NVIDIA hosts. The most concrete lead that exists for
-  this problem today, even so.
+  host-side `virglrenderer` process, allocate buffers host-side as native NVIDIA images, hand them
+  back as NVIDIA dmabufs — sidesteps the cross-vendor EGL/gralloc negotiation problem entirely,
+  exactly the class of bug hit here. **Originally flagged as needing a real Wayland compositor,
+  ruling out headless servers — reading their own architecture doc directly showed that's wrong**:
+  Wayland/KWin is only the *display* sink, specific to Waydroid's own `hwcomposer.waydroid` HAL,
+  not part of the Venus/virglrenderer rendering pipeline itself. redroid has its own, already-
+  headless hwcomposer and never needs that piece. See Tier 2 in the roadmap and the DEVLOG for the
+  full pipeline breakdown. The strongest lead for this problem, now confirmed compatible with
+  headless operation.
 - Untested variables worth tracking if revisited: `nvidia-open`/`nvidia-open-dkms` kernel modules
   vs. the classic proprietary blob (not yet confirmed which one the test machines were running),
   driver version (waydroid-nvidia's write-up specifies 595.71+ with `nvidia-drm.modeset=1`), and
@@ -103,26 +103,33 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       wall, not a config knob — confirms `waydroid-nvidia`'s Venus-proxy approach is the right
       direction rather than a nudge away. See DEVLOG's 2026-09-22 entry.
 - [x] **Tier 1 — ⭐ Check what redroid's own Mesa already ships before porting anything.**
-      Checked directly, not assumed: **nothing to reuse**. `/vendor/bin/gpu_config.sh` shows ANGLE
-      is only ever used as a *software* GLES fallback in guest mode (an alternative to
-      SwiftShader) — no gfxstream, no Venus, no host-forwarding layer of any kind actually wired
-      into this image; `host` mode is plain native Mesa GBM, nothing more. Found and fixed a real,
-      separate bug along the way: the render-node auto-detect loop doesn't recognize NVIDIA's
-      driver name (`nvidia-drm`), so `gralloc.gbm.device` silently never got set on NVIDIA hosts
-      without an explicit `androidboot.redroid_gpu_node=` override. Fixing it and re-testing with
-      the device path *provably* correct end to end (confirmed via `getprop`) produced the
-      **identical** `gbm_create_device()`/`EINVAL` failure — ruling out "the property wasn't set"
-      as an alternate explanation and confirming Tier 0's diagnosis on firmer ground: Mesa's own
-      GBM has no driver backend for NVIDIA's proprietary stack at all, only for `nouveau`. See
-      DEVLOG's second 2026-09-22 entry.
-- [ ] **Tier 2 — Understand `waydroid-nvidia`'s Venus-proxy architecture in depth.** The load-
-      bearing question: is the real Wayland compositor it requires structural (part of the
-      Vulkan WSI/present chain) or incidental (only used to show the final window)? If incidental,
-      a headless/virtual output sidesteps the constraint that currently rules this out for a bare
-      server.
-- [ ] **Tier 3 — Minimal headless host-side renderer prototype.** Confirm Venus can present (or
-      just read back a rendered buffer) without a real desktop session running, before touching
-      redroid's own init/boot process at all.
+      `/vendor/bin/gpu_config.sh` shows ANGLE is only ever used as a *software* GLES fallback in
+      guest mode (an alternative to SwiftShader) — `host` mode itself is plain native Mesa GBM,
+      no host-forwarding logic wired up or active. Found and fixed a real, separate bug along the
+      way: the render-node auto-detect loop doesn't recognize NVIDIA's driver name (`nvidia-drm`),
+      so `gralloc.gbm.device` silently never got set on NVIDIA hosts without an explicit
+      `androidboot.redroid_gpu_node=` override. Fixing it and re-testing with the device path
+      *provably* correct end to end (confirmed via `getprop`) produced the **identical**
+      `gbm_create_device()`/`EINVAL` failure — ruling out "the property wasn't set" as an
+      alternate explanation and confirming Tier 0's diagnosis on firmer ground. **Corrected by
+      Tier 2, below**: "nothing to reuse" turned out too strong — the vendor partition already
+      ships `vulkan.virtio.so` and `virtio_gpu_dri.so`, dormant guest-side Venus driver files,
+      just never activated on this hardware path. See DEVLOG's 2026-09-22 entries.
+- [x] **Tier 2 — ⭐ Understand `waydroid-nvidia`'s Venus-proxy architecture in depth.** The
+      load-bearing question — is the Wayland compositor it requires structural or incidental? —
+      is answered directly from their own architecture doc: **incidental**. The full rendering
+      pipeline (guest Mesa Venus → vtest unix socket → a standalone host `virglrenderer` process →
+      real Vulkan against NVIDIA → dmabuf) never touches Wayland at all; KWin only enters at the
+      very last step, through `hwcomposer.waydroid` — Waydroid's *own* hwcomposer HAL, built to
+      hand frames to a Wayland window. redroid has its own, already-headless hwcomposer HAL and
+      never needs that step. Bonus finding: redroid's vendor partition already ships the guest
+      side of exactly this bridge (`vulkan.virtio.so`, `virtio_gpu_dri.so`), just dormant — what's
+      genuinely missing is host-side infrastructure: a `virglrenderer` vtest/venus server against
+      the real driver, and minigbm's vtest allocation wrapper (a real patch upstream minigbm
+      doesn't have). See DEVLOG for the full pipeline diagram and reasoning.
+- [ ] **Tier 3 — Minimal headless host-side renderer prototype.** Get a bare `virglrenderer`
+      vtest/venus server talking to the real NVIDIA driver, confirmed working standalone — no
+      Wayland, no redroid boot process involved yet — before wiring anything into redroid at all.
 - [ ] **Tier 4 — Real integration into redroid.** Adapt the proxy into redroid's actual
       image/init, which isn't the same Android build or boot flow Waydroid uses.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
