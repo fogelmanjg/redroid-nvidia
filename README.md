@@ -145,13 +145,21 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       See DEVLOG for the full story including the kernel-module swap.
 - [ ] **Tier 4 — Real integration into redroid, in progress.** Checked whether
       `waydroid-nvidia`'s own guest-Android release could shortcut this the way the host release
-      did for Tier 3 — it can't. Their prebuilt `libgbm_mesa_wrapper.so` exports one custom symbol
-      (`get_gbm_ops`), not the standard GBM ABI; it only works with their own patched gralloc
-      dispatcher, which redroid doesn't have. redroid's real `gralloc.gbm.so` links `libgbm.so.1`
-      directly and calls the standard `gbm_*` API — confirmed by reading it, not assumed. What
-      Tier 4 actually needs: building minigbm from source against the Android NDK with a vtest
-      backend compiled in as a normal backend (standard symbols, genuine drop-in for the vendor
-      partition's `libgbm.so.1`), not a foreign wrapper file. Real cross-compile work. See DEVLOG.
+      did for Tier 3 — it can't (their `libgbm_mesa_wrapper.so` needs their own patched gralloc
+      dispatcher, which redroid doesn't have). Found the real target instead: redroid ships *two*
+      gralloc HALs side by side as prebuilts, `gralloc.gbm.so` (Mesa, no NVIDIA support) and
+      `gralloc.cros.so` (genuinely minigbm's real backend-dispatch system, confirmed via a local
+      AOSP checkout for this exact build) — `gpu_config.sh` just never selects `cros`. Wrote a new
+      minigbm backend registered for driver name `nvidia-drm` (first pass: generic KMS dumb
+      buffers, CPU-mappable only, as a cheap canary before the real GPU-accelerated vtest backend),
+      **built it successfully end to end with Soong** inside the project's existing build
+      container, and patched `gpu_config.sh` to select `cros` specifically when NVIDIA is detected.
+      Deployed for a real test: a new, different, more specific failure — `libdmabufheap.so` genuinely
+      exists on the system partition but Android's linker **namespace** isolation won't expose it to
+      the vendor HAL's `sphal` namespace. This build's default minigbm Soong config pulls in newer
+      Gralloc4-style dependencies the original prebuilt never needed. Real, scoped blocker, not a
+      mystery — either find the Soong flag for the simpler allocation path, or fix the namespace
+      rule. See DEVLOG for the full build story.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —

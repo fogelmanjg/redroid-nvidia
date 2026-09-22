@@ -474,3 +474,63 @@ more than what Tiers 0-3 needed. Their own `vulkan.virtio.so` build is likely fi
 (same standard Vulkan ICD entry points redroid's own copy already uses) — the gralloc layer is
 the one piece that needs real source work. Paused here to decide how deep to go on this build
 before spending the hours it needs.
+
+## 2026-09-22 (same day) — Tier 4: a real minigbm backend, built end to end, blocked by a linker namespace mismatch
+
+Went ahead with the real build. Found something that changes the whole plan for the better first:
+a full local AOSP checkout for this exact redroid build already exists on disk
+(`~/aosp-redroid-15`), including `external/minigbm` — the actual source this image's gralloc HALs
+trace back to, and a working build container (`redroid-builder`) already used for prior work.
+
+**Real discovery, checked rather than assumed**: `gralloc.cros.so` and `gralloc.gbm.so` are
+**prebuilts** in this tree (`device/redroid-prebuilts/Android.mk`, `LOCAL_SRC_FILES := prebuilts/
+$(TARGET_ARCH)/lib/...`) — not built by the normal `m` product build at all. `gralloc.gbm.so`
+links Mesa's own `libgbm.so.1` (confirmed earlier); `gralloc.cros.so`, by contrast, has
+`backend_amdgpu`/`backend_i915`/`backend_virtgpu`/etc statically linked in — genuinely minigbm's
+`drv.c` dispatch, matching this exact `external/minigbm` checkout. Two different gralloc
+implementations exist side by side in the vendor partition; redroid's `gpu_config.sh` just always
+picks `gbm` (Mesa) in host mode, never `cros` (minigbm). This means the real target for a new
+backend is minigbm's `cros` build, reachable via `ro.hardware.gralloc=cros` — not Mesa's `gbm` at
+all, and not something `gpu_config.sh` currently ever selects.
+
+**Wrote a new minigbm backend**, registered for DRM driver name `nvidia-drm` (the string
+`drmGetVersion()` actually reports for this hardware — confirmed back in Tier 0). Used
+`dumb_driver.c`'s existing `INIT_DUMB_DRIVER_WITH_NAME` macro as the starting shape (the simplest
+real backend in the tree, already registers `backend_nouveau` the same way) — this first pass
+uses minigbm's generic `DRM_IOCTL_MODE_CREATE_DUMB` path (every real KMS driver supports it,
+including `nvidia-drm.ko` with `modeset=1`), so it's CPU-mappable linear buffers only, no GPU
+acceleration yet — a canary to validate the whole build→deploy→test loop cheaply before writing
+the much larger vtest/Venus-based real backend. Registered in `drv.c`'s `drv_backend_list[]`
+alongside the existing entries.
+
+**Built successfully with Soong**, end to end, inside `redroid-builder`: `lunch
+redroid_x86_64-ap3a-userdebug && m gralloc.minigbm` — first build (Soong analysis phase from a
+`out/` that had never actually been built), ~16 minutes, exit 0. Confirmed the new backend's
+string (`nvidia-drm`) is genuinely compiled into `libminigbm_gralloc.so` — the real backend
+library that the thin `gralloc.minigbm.so` HAL shim dynamically depends on (a two-file split this
+Soong config produces, different from the prebuilt's single statically-linked file, discovered by
+comparing `NEEDED` entries).
+
+**Deployed for a real test**: copied both new `.so` files (64 and 32-bit) into a fresh container
+as `gralloc.cros.so` / `libminigbm_gralloc.so`, plus a patched `gpu_config.sh` that sets
+`ro.hardware.gralloc=cros` specifically when the detected driver is `nvidia-drm` (leaving every
+other vendor's existing `gbm` selection untouched — a real, driver-conditional change, not a
+blanket override). **New, different, more specific failure** — real progress, not a repeat:
+
+```
+vndksupport: Could not load /vendor/lib64/hw/gralloc.cros.so from sphal namespace:
+  dlopen failed: library "libdmabufheap.so" not found: needed by ... in namespace sphal.
+```
+
+`libdmabufheap.so` genuinely exists on the system partition (confirmed present) — this is Android's
+linker **namespace** isolation refusing to let a vendor HAL loaded through the `sphal` namespace
+see it, not a missing file. This build's Soong defaults for `libminigbm_gralloc` pull in
+`libdmabufheap`/`libgralloctypes`/`libnativewindow` as direct dependencies — a newer, Gralloc4-
+style dependency set this specific redroid image's actual deployed linker/VINTF configuration
+apparently doesn't expose to vendor HALs (the original prebuilt `gralloc.cros.so` never needed any
+of these — confirmed via its own, much smaller `NEEDED` list read back in Tier 1). Two real paths
+forward, neither chased tonight: (1) find and flip whatever Soong config selects the older,
+simpler allocation path (avoiding the new dependency entirely) that the original prebuilt was
+clearly built with, or (2) fix the actual VINTF/linkerconfig namespace rule to expose
+`libdmabufheap.so` to `sphal`. Real, understood, scoped blocker — not a mystery — paused here for
+the day.
