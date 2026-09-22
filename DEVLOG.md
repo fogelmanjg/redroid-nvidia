@@ -373,3 +373,69 @@ have it. None of it touches Wayland, KWin, or `hwcomposer.waydroid` — redroid 
 already-headless display path throughout. Tier 3 (minimal headless host-side renderer prototype)
 is next: get a bare `virglrenderer` vtest/venus server talking to the real NVIDIA driver, confirmed
 working standalone, before wiring anything into redroid's boot process at all.
+
+## 2026-09-22 (same day) — Tier 3: real Venus compute round-trip confirmed on the actual NVIDIA driver, standalone
+
+**Prerequisite discovered first, not assumed**: `waydroid-nvidia`'s own `tests/run-probe.sh`
+explicitly requires the **open** NVIDIA kernel module — the closed/proprietary `.ko` has no
+DMA-BUF support, and every buffer in this whole approach is one. Checked `jgustavo48` (the RTX
+4060 machine, driver 595.91.07): running the closed module (`nvidia-kernel-dkms`). Confirmed with
+the user this was worth doing given how central it is (a live gaming/streaming machine, Sunshine
+running on it), talked through what does and doesn't change (same userspace either way — GLX/EGL/
+Vulkan/CUDA/NVENC libraries are identical, only the `.ko` differs; the one real unknown flagged
+was HDMI HDR 4:4:4 output, tied to `nvidia-drm.ko`'s modesetting specifically), then swapped via
+NVIDIA's own CUDA apt repo (`nvidia-open` metapackage, pinned to the exact installed 595.91.07 —
+Debian's own `contrib` package for this is stuck on a stale, mismatched 550.163.01 and would have
+been a real footgun). Dry-run first, confirmed a clean 1:1 swap (`nvidia-kernel-dkms` out,
+`nvidia-kernel-open-dkms` in, matching versions, nothing else touched), DKMS build verified
+successful for the running kernel *before* rebooting, Secure Boot confirmed disabled (so MOK
+signing was a non-issue either way). Rebooted. Came back clean: `NVRM version: ... Open Kernel
+Module ...`, `nvidia_drm` modeset still `Y`, Plasma/X11 session, KWin and Sunshine both back up on
+their own via autologin/systemd user units, `glxinfo`/`vulkaninfo` both report the real RTX 4060.
+No regressions observed; HDR/4:4:4 specifically is the one thing that needs the user's own eyes on
+an actual TV connection to fully confirm.
+
+**The actual Tier 3 test**: downloaded the project's own `v0.1.2` GitHub release
+(`waydroid-nvidia-host-x86_64-v0.1.2.tar.zst`, checksum verified against the release's
+`SHA256SUMS`) rather than building `virglrenderer` from source — it's exactly three files
+(`virgl_test_server`, `virgl_render_server`, `libvirglrenderer.so.1`), no NVIDIA-specific host
+setup needed beyond the kernel module above. Also found the glibc build of Mesa's virtio/Venus
+Vulkan guest driver **already packaged in Debian** (`mesa-vulkan-drivers` ships
+`libvulkan_virtio.so` + `virtio_icd.json`) — no need to cross-compile Mesa for this standalone
+test at all; that's only required later for the actual Android/bionic guest side.
+
+Two real bugs, found and fixed in order:
+
+1. `virgl_test_server --venus --use-egl-surfaceless --rendernode /dev/dri/renderD128
+   --socket-path <path>` starts silently either way — success or failure both produce no output by
+   default. The vtest socket got created either way, so "the socket exists" is not proof the
+   server is healthy. Needed `VIRGL_LOG_LEVEL=debug` to get real diagnostics at all.
+2. With that on, the actual failure was `proxy: failed to exec
+   /usr/local/libexec/virgl_render_server: No such file or directory` — `virgl_test_server` forks
+   a sandboxed helper process (`virgl_render_server`, the one that actually holds the Vulkan
+   context) at a **hardcoded** path, not relative to wherever the binaries happen to sit. The
+   release tarball ships it as a plain file alongside the others, expecting the AUR
+   package/systemd unit to install it to that path — running ad hoc from an extracted tarball
+   needs that done manually. Fixed with a plain `cp` to `/usr/local/libexec/virgl_render_server`
+   (creating the dir) plus `libvirglrenderer.so.1` into `/usr/local/lib` + `ldconfig` so the helper
+   process's own dependency resolves too.
+
+**With both fixed, the real test — `tests/vnprobe.c`, compiled locally against Debian's system
+`libvulkan-dev`** (a real Vulkan compute pipeline: shader module, descriptor set, command buffer,
+dispatch, fence wait, mapped-memory readback, checked value-by-value against the expected
+computed result — not a toy, the same rigor this project holds itself to elsewhere) **— passed
+outright, first real run after both fixes**:
+
+```
+device: Virtio-GPU Venus (NVIDIA GeForce RTX 4060)
+PASS: 65536 elements computed correctly on 'Virtio-GPU Venus (NVIDIA GeForce RTX 4060)'
+```
+
+The full chain — Debian's packaged Mesa Venus Vulkan driver (client) → `VTEST_SOCKET_NAME` unix
+socket → `virgl_test_server` → `virgl_render_server` → the real, open-module NVIDIA driver → RTX
+4060 → 65536 correctly computed values read back — works standalone, no Wayland, no redroid, no
+Android anywhere in the loop yet. This is the exact shape of bridge redroid needs, proven to
+actually carry real GPU work end to end on this hardware before touching redroid's boot process at
+all. Tier 4 (real integration into redroid) is next: get this same host renderer reachable from
+inside a redroid container, with redroid's *own* dormant guest Venus driver
+(`vulkan.virtio.so`, found in Tier 2) talking to it instead of this standalone test client.

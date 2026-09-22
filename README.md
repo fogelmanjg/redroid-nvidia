@@ -127,11 +127,26 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       genuinely missing is host-side infrastructure: a `virglrenderer` vtest/venus server against
       the real driver, and minigbm's vtest allocation wrapper (a real patch upstream minigbm
       doesn't have). See DEVLOG for the full pipeline diagram and reasoning.
-- [ ] **Tier 3 — Minimal headless host-side renderer prototype.** Get a bare `virglrenderer`
-      vtest/venus server talking to the real NVIDIA driver, confirmed working standalone — no
-      Wayland, no redroid boot process involved yet — before wiring anything into redroid at all.
-- [ ] **Tier 4 — Real integration into redroid.** Adapt the proxy into redroid's actual
-      image/init, which isn't the same Android build or boot flow Waydroid uses.
+- [x] **Tier 3 — ⭐ Minimal headless host-side renderer prototype.** Confirmed for real, standalone,
+      no Wayland/redroid/Android anywhere in the loop. First had to swap `jgustavo48`'s NVIDIA
+      driver to the **open** kernel module (a real prerequisite — the closed module has no DMA-BUF
+      support, and every buffer here is one; done carefully since it's a live gaming/streaming
+      machine, via NVIDIA's own apt repo at the exact installed driver version to avoid a userspace/
+      kernel-module mismatch, no regressions found). Then downloaded the project's own `v0.1.2`
+      GitHub release (host binaries, checksum-verified — no need to build `virglrenderer` from
+      source) and used **Debian's own packaged** Mesa Venus Vulkan driver
+      (`mesa-vulkan-drivers`' `libvulkan_virtio.so`) as the test client — no Mesa cross-build
+      needed for this stage either. Found and fixed two real bugs (silent failure without
+      `VIRGL_LOG_LEVEL=debug`; the sandboxed render-helper process expects a hardcoded install
+      path the release tarball doesn't create). With both fixed, a real Vulkan compute shader —
+      dispatch, fence wait, readback, verified value-by-value — passed outright over the vtest
+      socket against the real RTX 4060:
+      `PASS: 65536 elements computed correctly on 'Virtio-GPU Venus (NVIDIA GeForce RTX 4060)'`.
+      See DEVLOG for the full story including the kernel-module swap.
+- [ ] **Tier 4 — Real integration into redroid.** Get this same host renderer reachable from
+      inside a redroid container, with redroid's own dormant guest Venus driver
+      (`vulkan.virtio.so`, found in Tier 2) talking to it — not the same Android build or boot
+      flow Waydroid uses, so this is real integration work, not a copy-paste.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
