@@ -85,26 +85,51 @@ Real findings from initial investigation, carried over so this doesn't start fro
   GPU generation (Turing/RTX 20 or newer confirmed working there; the Pascal-era GTX 1050 Ti used
   for testing here is older than that — the RTX 4060 (Ada) in this same fleet would qualify).
 
-## Roadmap
+## Roadmap (by difficulty, not by time)
 
-Nothing below is started as active work yet — this is the shape of the problem, not a schedule.
+Same shape as [redroid-hwenc](https://github.com/fogelmanjg/redroid-hwenc)'s roadmap: each tier
+assumes the previous one is done, documented session by session in [DEVLOG.md](DEVLOG.md) as it
+happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
 
-- [ ] **Get `gpuMode=host` to boot on NVIDIA at all.** The actual blocker, now precisely scoped:
-      Android's guest-side Mesa GBM (bionic) cannot load NVIDIA's real GBM backend (glibc) at all
-      — confirmed a genuine cross-libc/cross-namespace wall, not a config gap (see DEVLOG
-      2026-09-22). `waydroid-nvidia`'s Venus-proxy approach — route rendering through a host-side
-      process that *can* load NVIDIA's real stack, instead of expecting the Android guest to do it
-      directly — is the strongest lead, now confirmed by direct evidence rather than analogy.
-      Adapting it to work headless (no real Wayland compositor) is the open question.
-- [ ] **Confirm real 3D acceleration works end to end** once boot succeeds — not just "doesn't
-      crash," an actual rendered frame, the same bar redroid-hwenc held itself to for encode.
-- [ ] **Hardware video decode.** Should become reachable once `gpuMode=host` genuinely works —
+- [x] **Tier 0 — Confirm or kill the "special Docker" theory, and get a real, precise diagnosis.**
+      Ruled out `nvidia-docker2` (deprecated, replaced by `nvidia-container-toolkit` on stock
+      Docker). Found the real gap instead: `NVIDIA_DRIVER_CAPABILITIES` silently defaulted to
+      `utility,compute` in every prior test, so NVIDIA's graphics/EGL/GBM pieces were plausibly
+      never actually in the container being tested. Fixed it, confirmed the libraries genuinely
+      present inside a running container (not just inferred from the host-side CDI spec file), and
+      watched the original `chooseEglConfig`/`SIGABRT` crash disappear — replaced by a precise,
+      understood one: Android's bionic-built Mesa GBM has no driver-table entry for NVIDIA and no
+      way to reach NVIDIA's real (glibc-only) GBM backend. A genuine cross-libc/cross-namespace
+      wall, not a config knob — confirms `waydroid-nvidia`'s Venus-proxy approach is the right
+      direction rather than a nudge away. See DEVLOG's 2026-09-22 entry.
+- [ ] **Tier 1 — ⭐ Check what redroid's own Mesa already ships before porting anything.** Real
+      finding from redroid-hwenc: this build's Mesa only compiles the `gfxstream`/ANGLE
+      Vulkan-forwarding-to-host pieces for Android, no native GPU driver at all — conceptually the
+      same shape as Venus (guest-side proxy, host-side renderer). Check whether
+      `androidboot.redroid_gpu_mode` has more values than `host`/`guest`, and whether that
+      guest-side gfxstream piece already has something to talk to, before assuming the whole
+      guest/host proxy needs to be built from scratch.
+- [ ] **Tier 2 — Understand `waydroid-nvidia`'s Venus-proxy architecture in depth.** The load-
+      bearing question: is the real Wayland compositor it requires structural (part of the
+      Vulkan WSI/present chain) or incidental (only used to show the final window)? If incidental,
+      a headless/virtual output sidesteps the constraint that currently rules this out for a bare
+      server.
+- [ ] **Tier 3 — Minimal headless host-side renderer prototype.** Confirm Venus can present (or
+      just read back a rendered buffer) without a real desktop session running, before touching
+      redroid's own init/boot process at all.
+- [ ] **Tier 4 — Real integration into redroid.** Adapt the proxy into redroid's actual
+      image/init, which isn't the same Android build or boot flow Waydroid uses.
+- [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
+      for encode: an actual verified rendered frame, not just "doesn't crash."
+- [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
       `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
       been investigated at all yet in this context.
-- [ ] **Hardware video encode (NVENC).** The actual encode goal, structurally similar to what
-      redroid-hwenc solved for VA-API — likely a host-side daemon speaking NVENC instead of
+- [ ] **Tier 7 — Hardware video encode (NVENC).** The actual encode goal, structurally similar to
+      what redroid-hwenc solved for VA-API — likely a host-side daemon speaking NVENC instead of
       VA-API, reusing whatever of that project's architecture (Codec2 component shape, protocol
-      design) still applies once the encode-specific parts are swapped. Not started.
+      design) still applies once the encode-specific parts are swapped.
+
+Even if it doesn't go further, each tier on its own is a publishable contribution.
 
 ## Why a separate repo
 
