@@ -102,13 +102,19 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       way to reach NVIDIA's real (glibc-only) GBM backend. A genuine cross-libc/cross-namespace
       wall, not a config knob — confirms `waydroid-nvidia`'s Venus-proxy approach is the right
       direction rather than a nudge away. See DEVLOG's 2026-09-22 entry.
-- [ ] **Tier 1 — ⭐ Check what redroid's own Mesa already ships before porting anything.** Real
-      finding from redroid-hwenc: this build's Mesa only compiles the `gfxstream`/ANGLE
-      Vulkan-forwarding-to-host pieces for Android, no native GPU driver at all — conceptually the
-      same shape as Venus (guest-side proxy, host-side renderer). Check whether
-      `androidboot.redroid_gpu_mode` has more values than `host`/`guest`, and whether that
-      guest-side gfxstream piece already has something to talk to, before assuming the whole
-      guest/host proxy needs to be built from scratch.
+- [x] **Tier 1 — ⭐ Check what redroid's own Mesa already ships before porting anything.**
+      Checked directly, not assumed: **nothing to reuse**. `/vendor/bin/gpu_config.sh` shows ANGLE
+      is only ever used as a *software* GLES fallback in guest mode (an alternative to
+      SwiftShader) — no gfxstream, no Venus, no host-forwarding layer of any kind actually wired
+      into this image; `host` mode is plain native Mesa GBM, nothing more. Found and fixed a real,
+      separate bug along the way: the render-node auto-detect loop doesn't recognize NVIDIA's
+      driver name (`nvidia-drm`), so `gralloc.gbm.device` silently never got set on NVIDIA hosts
+      without an explicit `androidboot.redroid_gpu_node=` override. Fixing it and re-testing with
+      the device path *provably* correct end to end (confirmed via `getprop`) produced the
+      **identical** `gbm_create_device()`/`EINVAL` failure — ruling out "the property wasn't set"
+      as an alternate explanation and confirming Tier 0's diagnosis on firmer ground: Mesa's own
+      GBM has no driver backend for NVIDIA's proprietary stack at all, only for `nouveau`. See
+      DEVLOG's second 2026-09-22 entry.
 - [ ] **Tier 2 — Understand `waydroid-nvidia`'s Venus-proxy architecture in depth.** The load-
       bearing question: is the real Wayland compositor it requires structural (part of the
       Vulkan WSI/present chain) or incidental (only used to show the final window)? If incidental,

@@ -260,3 +260,44 @@ class of problem `waydroid-nvidia`'s Venus-proxy architecture (see two entries a
 sidestep — route rendering through a host-side process that *can* load NVIDIA's real stack,
 instead of expecting the Android guest to do it directly. It remains the strongest lead, now with
 direct confirmation (not just analogy) that the guest-direct path is a dead end on this stack.
+
+## 2026-09-22 (same day) — Tier 1: nothing to reuse, but a real separate bug found and a stronger confirmation of the wall
+
+Went looking for whether redroid's own Mesa build already ships some form of host-forwarding
+(gfxstream, Venus, anything) before assuming the whole guest/host proxy needs to be built from
+scratch — redroid-hwenc's own notes mention this build's Mesa compiling "gfxstream/ANGLE" pieces
+for Android. Checked directly inside a running container image (`redroid-jg-15:gapps-official`
+on `jgustavo48`): **there is no gfxstream, no Venus, nothing host-forwarding at all.** ANGLE
+(`libEGL_angle.so`) is present, but reading `/vendor/bin/gpu_config.sh` directly shows exactly
+what it's for — `gpu_setup_guest()` uses it purely as an alternative **software** GLES
+implementation (a pick between ANGLE and SwiftShader when no usable GPU is found), completely
+unrelated to hardware forwarding. `gpu_setup_host()` only ever sets `ro.hardware.egl=mesa` /
+`ro.hardware.gralloc=gbm` — plain native Mesa GBM, no proxy layer of any kind. Nothing to reuse
+here; the earlier note was about what Mesa's upstream source tree *can* compile for Android in
+general, not what's actually wired into this image. Tier 1 closes clean, just with a "no" instead
+of a shortcut.
+
+**Real, separate bug found while reading that script**, worth fixing independent of the NVIDIA
+question: `setup_render_node()`'s auto-detect loop only recognizes a fixed driver allow-list
+(`i915|amdgpu|nouveau|virtio_gpu|v3d|vc4|msm_drm|panfrost`) when picking a DRI node in `host`
+mode. `nouveau` (the FOSS reverse-engineered NVIDIA driver) is in that list — but the proprietary
+NVIDIA driver registers itself as `nvidia-drm` in `/sys/kernel/debug/dri/N/name` (confirmed
+directly: `nvidia-drm dev=0000:07:00.0`), which matches nothing in the list. Without an explicit
+`androidboot.redroid_gpu_node=` override, the auto-detect loop silently never sets
+`gralloc.gbm.device` at all on an NVIDIA host, even in explicit `host` mode (whose top-level
+branch doesn't check the loop's return value, so `gpu_setup_host()` runs anyway, just with that
+property left unset). A real gap worth reporting upstream separately, and worth always passing
+`androidboot.redroid_gpu_node=/dev/dri/renderD128` explicitly on NVIDIA hosts going forward.
+
+**But fixing it changes nothing about the actual wall.** Re-tested with both
+`androidboot.redroid_gpu_mode=host` and `androidboot.redroid_gpu_node=/dev/dri/renderD128` passed
+together (confirmed via `getprop`: `gralloc.gbm.device` correctly set to `/dev/dri/renderD128`,
+mode correctly `host`) — `vendor.gralloc-2-0` fails at `gbm_create_device()` with the exact same
+`Invalid argument`, crash-loops `surfaceflinger` the same way, boot doesn't complete. Same result
+with the device path now provably correct end to end. This rules out "the property just wasn't
+set" as an alternate explanation and leaves Tier 0's diagnosis standing on firmer ground: Mesa's
+own `libgbm.so.1` (this build's bionic-compiled GBM) simply has no driver backend for NVIDIA's
+proprietary stack — only for `nouveau`, the open driver, which isn't what's running here. The
+wall holds regardless of which correct device node it's pointed at. Tier 2 (understanding
+`waydroid-nvidia`'s Venus-proxy architecture, and specifically whether its Wayland-compositor
+requirement is structural or incidental) is next.
