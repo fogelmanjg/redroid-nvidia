@@ -439,3 +439,38 @@ actually carry real GPU work end to end on this hardware before touching redroid
 all. Tier 4 (real integration into redroid) is next: get this same host renderer reachable from
 inside a redroid container, with redroid's *own* dormant guest Venus driver
 (`vulkan.virtio.so`, found in Tier 2) talking to it instead of this standalone test client.
+
+## 2026-09-22 (same day) — Tier 4, first real finding: the prebuilt gralloc wrapper isn't a drop-in, checked before assuming
+
+Started Tier 4 by checking whether `waydroid-nvidia`'s own guest-side release could shortcut
+things the way the host release did for Tier 3. Downloaded and checksum-verified
+`waydroid-nvidia-guest-android-x86_64-v0.1.2.tar.zst` and `-guest-prebuilts-v0.1.2.tar.zst`.
+Found exactly the file Tier 2 flagged as genuinely missing — `vendor/lib64/libgbm_mesa_wrapper.so`,
+the built vtest gralloc backend — plus their own `vulkan.virtio.so` build and (not needed here)
+their `hwcomposer.waydroid.so` and a patched LineageOS 20 `surfaceflinger` binary, both specific
+to Waydroid's own Android base and not something to mix into redroid's.
+
+**Checked whether it's actually a drop-in before assuming it is**, since redroid's real
+`gralloc.gbm.so` was already read directly in Tier 1/2: `strings` on it shows it links straight
+against `libgbm.so.1` and calls the standard GBM C ABI (`gbm_create_device`, etc.) — no
+indirection. `readelf --dyn-syms` on their `libgbm_mesa_wrapper.so`, by contrast, exports exactly
+**one** symbol: `get_gbm_ops` — a custom vtable-style entry point, not the standard GBM ABI at
+all. This means their file only works with a gralloc dispatcher that already knows to `dlopen()`
+it and call `get_gbm_ops()` — a patch to minigbm's *own* internal backend-selection logic that
+lives in Waydroid's fork, not in redroid's stock, unpatched gralloc/minigbm. Dropping the file
+into redroid's vendor partition as-is would do nothing; nothing in redroid's `gralloc.gbm.so`
+would ever call it.
+
+**Where this actually leaves Tier 4**: the "one real missing piece" framing from Tier 2 was
+correct about *what's* missing (a vtest-aware GBM allocation backend) but understated *how* it
+has to be delivered for redroid specifically — not as a foreign wrapper file, but as a proper
+minigbm build with the vtest backend compiled in *as a normal backend*, exporting the standard
+`gbm_*` symbols redroid's `gralloc.gbm.so` already calls, so it becomes a genuine drop-in
+replacement for the vendor partition's existing `libgbm.so.1`. That means building minigbm from
+source against the Android NDK, with `waydroid-nvidia`'s `src/minigbm-vtest/vtest_wrapper.c` (or
+the reasoning in it) adapted into a standard backend rather than used through their custom
+dispatch hook — real cross-compile work, not a config change or a binary copy, and meaningfully
+more than what Tiers 0-3 needed. Their own `vulkan.virtio.so` build is likely fine to reuse as-is
+(same standard Vulkan ICD entry points redroid's own copy already uses) — the gralloc layer is
+the one piece that needs real source work. Paused here to decide how deep to go on this build
+before spending the hours it needs.

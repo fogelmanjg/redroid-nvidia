@@ -143,10 +143,15 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       socket against the real RTX 4060:
       `PASS: 65536 elements computed correctly on 'Virtio-GPU Venus (NVIDIA GeForce RTX 4060)'`.
       See DEVLOG for the full story including the kernel-module swap.
-- [ ] **Tier 4 — Real integration into redroid.** Get this same host renderer reachable from
-      inside a redroid container, with redroid's own dormant guest Venus driver
-      (`vulkan.virtio.so`, found in Tier 2) talking to it — not the same Android build or boot
-      flow Waydroid uses, so this is real integration work, not a copy-paste.
+- [ ] **Tier 4 — Real integration into redroid, in progress.** Checked whether
+      `waydroid-nvidia`'s own guest-Android release could shortcut this the way the host release
+      did for Tier 3 — it can't. Their prebuilt `libgbm_mesa_wrapper.so` exports one custom symbol
+      (`get_gbm_ops`), not the standard GBM ABI; it only works with their own patched gralloc
+      dispatcher, which redroid doesn't have. redroid's real `gralloc.gbm.so` links `libgbm.so.1`
+      directly and calls the standard `gbm_*` API — confirmed by reading it, not assumed. What
+      Tier 4 actually needs: building minigbm from source against the Android NDK with a vtest
+      backend compiled in as a normal backend (standard symbols, genuine drop-in for the vendor
+      partition's `libgbm.so.1`), not a foreign wrapper file. Real cross-compile work. See DEVLOG.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
