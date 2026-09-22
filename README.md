@@ -48,10 +48,21 @@ Real findings from initial investigation, carried over so this doesn't start fro
   `system` AID) isn't in that group in the container's Android-only user model. Host-side `chmod`
   has no effect — `nvidia-container-toolkit` recreates the node fresh inside the container, not a
   true bind-mount. Fix: `chmod 666` from *inside* the running container.
-- **NVIDIA's GBM/Vulkan/EGL pieces do reach the container correctly** — `nvidia-container-toolkit`'s
-  CDI spec injects `libnvidia-egl-gbm.so`, `nvidia-drm_gbm.so`, EGL external platform configs, and
-  the Vulkan ICD. Ruled out as an incomplete-environment problem; it's a genuine negotiation
-  failure, not a missing piece.
+- **`NVIDIA_DRIVER_CAPABILITIES` defaults to `utility,compute` only** — no `graphics`, `video`, or
+  `display` — unless set explicitly. All earlier testing used bare `--gpus all` without ever
+  setting it; the "reaches the container" check below was done by reading the host-side generated
+  CDI spec file, not a running container, so it couldn't have caught this gap. Fixed
+  (`NVIDIA_DRIVER_CAPABILITIES=all` on every `docker run` from now on) and confirmed the graphics
+  libraries genuinely present *inside* a running container via `docker exec`, not just inferred.
+  With that fixed, the original `chooseEglConfig`/`SIGABRT` crash signature is **gone**.
+- **The real blocker, found once the capability gap above was fixed**: redroid's own vendor
+  gralloc (`gralloc.redroid.so`, Mesa's GBM built against Android's bionic libc) now genuinely
+  runs, but fails at `gbm_create_device()` with `EINVAL` — its driver-name dispatch table only
+  knows Mesa's own DRI drivers (i915, radeonsi, amdgpu, …), not NVIDIA. NVIDIA's *real* GBM
+  backend (`nvidia-drm_gbm.so`) is present in the container, correctly injected by CDI — but under
+  a glibc-only path (`/usr/lib/x86_64-linux-gnu/gbm/`) that Android's bionic-linked vendor HAL has
+  no mechanism to load from at all. A genuine cross-libc, cross-namespace wall, not a missing file
+  or a config flag — see DEVLOG's 2026-09-22 entry for the full reasoning.
 - **Forcing Zink (Mesa's GL-over-Vulkan driver)** via the usual env vars didn't change the crash
   signature — inconclusive as a real test, since Android's `platform_android` EGL backend likely
   doesn't honor those particular override points the same way a normal desktop Mesa app would.
@@ -78,11 +89,13 @@ Real findings from initial investigation, carried over so this doesn't start fro
 
 Nothing below is started as active work yet — this is the shape of the problem, not a schedule.
 
-- [ ] **Get `gpuMode=host` to boot on NVIDIA at all.** The actual blocker. Either find what
-      `gralloc.redroid.so` needs to handle NVIDIA (and why it's declining today), or find the
-      specific EGL config negotiation gap between Mesa's fallback gralloc and NVIDIA's EGL
-      implementation and close it narrowly. `waydroid-nvidia`'s Venus-proxy approach is the
-      strongest lead, adapted to work headless.
+- [ ] **Get `gpuMode=host` to boot on NVIDIA at all.** The actual blocker, now precisely scoped:
+      Android's guest-side Mesa GBM (bionic) cannot load NVIDIA's real GBM backend (glibc) at all
+      — confirmed a genuine cross-libc/cross-namespace wall, not a config gap (see DEVLOG
+      2026-09-22). `waydroid-nvidia`'s Venus-proxy approach — route rendering through a host-side
+      process that *can* load NVIDIA's real stack, instead of expecting the Android guest to do it
+      directly — is the strongest lead, now confirmed by direct evidence rather than analogy.
+      Adapting it to work headless (no real Wayland compositor) is the open question.
 - [ ] **Confirm real 3D acceleration works end to end** once boot succeeds — not just "doesn't
       crash," an actual rendered frame, the same bar redroid-hwenc held itself to for encode.
 - [ ] **Hardware video decode.** Should become reachable once `gpuMode=host` genuinely works —

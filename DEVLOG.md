@@ -187,3 +187,76 @@ encode working end to end for a real app). NVIDIA needs its own foundation first
 the technical work is unrelated to VA-API encode, so this history moved here rather than
 continuing to live inside a project that's actually about something else now. Nothing new
 investigated yet in this entry — the four entries above are the starting point, not new findings.
+
+## 2026-09-22 (same day) — The `gpuMode=host` crash was a false diagnosis: driver capability was never actually on
+
+Went hunting for whether "you need a special NVIDIA-flavored Docker" (a claim floating around
+online) was real, before touching architecture. It isn't, quite — `nvidia-docker2` (the old
+wrapper) is deprecated and archived, fully replaced by `nvidia-container-toolkit`, which runs on
+stock Docker CE (already what's installed everywhere in this fleet). But chasing it turned up
+something real: `nvidia-container-toolkit` hard-codes `NVIDIA_DRIVER_CAPABILITIES` to
+**`utility,compute` only** when it's unset — no `graphics`, no `video`, no `display`. Every prior
+test of `gpuMode=host` on NVIDIA (see the three entries above) used bare `--gpus all`, which only
+controls GPU *visibility*, never *capabilities* — and `NVIDIA_DRIVER_CAPABILITIES` was never set
+anywhere. The earlier "confirmed complete" check of NVIDIA's GBM/EGL/Vulkan pieces reaching the
+container was done by reading `nvidia-container-toolkit`'s generated CDI spec on the *host*
+(`/var/run/cdi/nvidia.yaml`), not by checking what actually landed inside a *running* container —
+that file lists mounts for every capability by construction, so it couldn't have caught this.
+
+Tested on `jgustavo48` (RTX 4060 / Ada, driver 595.91.07, toolkit 1.20.1, driver's own
+`nvidia_drm` already has `modeset=Y`). Two real bugs found and fixed on the way to a clean test:
+
+- **`modprobe loop ext4` only loads `loop`.** Classic footgun: `modprobe` treats trailing
+  arguments as *parameters* to the first module, not additional module names. `ext4` was silently
+  never loaded on this fresh host despite the command appearing to succeed — reproduced the exact
+  `apexd-bootstrap`/`No such device` boot failure from the very first NVIDIA entry above, on a
+  machine that should've been past that. Fixed with two separate `modprobe` calls. Worth folding
+  into `redroid-manager`'s Doctor checks as its own item, distinct from "are the modules loaded at
+  all."
+- **`/dev/binder*` and `/dev/dri/renderD128` need `chmod 666` from the host / from inside the
+  running container respectively** — consistent with bugs already logged in the entries above,
+  just re-confirmed on a fresh machine.
+
+With `docker run --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all ...` (graphics libraries confirmed
+actually present inside the running container this time — `libnvidia-egl-gbm.so`,
+`nvidia_icd.json`, `/usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so` all found via `docker exec`,
+not just inferred from the host-side CDI file): **the previously-documented crash signature is
+gone.** No more `SkiaGLRenderEngine::chooseEglConfig` / `Fatal signal 6`. `surfaceflinger` still
+doesn't come up and boot still doesn't complete, but for a completely different, more specific
+reason:
+
+```
+GRALLOC-GBM: failed to create gbm device
+AllocatorHal: failed to open gralloc0 device: Invalid argument
+```
+
+**This is real progress, not just a different flavor of the same wall.** Before, Mesa's Android
+gralloc was silently declining to even try and falling back to a generic implementation that then
+failed to negotiate with NVIDIA's EGL — a vague, one-shot failure. Now redroid's actual vendor
+gralloc (`gralloc.redroid.so` / `/vendor/lib64/libgbm.so.1`, tagged `GRALLOC-GBM` in these logs)
+is genuinely running and calling `gbm_create_device()` for real, and failing at that specific
+call, repeatably.
+
+**Why it fails, reasoned through rather than guessed:** `/vendor/lib64/libgbm.so.1` inside the
+container is Mesa's *own* GBM implementation, built against Android's bionic libc as part of
+redroid's vendor partition — its `gbm_create_device()` dispatches by matching the DRM driver name
+(via `drmGetVersion()`) against Mesa's own compiled-in DRI driver table (`i915`, `radeonsi`,
+`amdgpu`, etc.). NVIDIA's driver name isn't in that table, so it fails closed — `EINVAL`, no
+usable device. Meanwhile NVIDIA's *actual* real GBM backend
+(`/usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so`, confirmed present and correctly injected by
+CDI) sits under a completely different, glibc-only path — one that Android's bionic-linked vendor
+HAL processes have no mechanism to even look in, let alone load a glibc shared object from,
+independent of whether the file exists. **This is a real ABI/namespace wall between Android's
+guest-side Mesa GBM and NVIDIA's host-side GBM backend, not a missing file or a config knob** —
+matches the "NVIDIA doesn't build `nvidia-utils` against bionic" friction point already flagged as
+a risk two entries above, now hit directly and concretely instead of just anticipated.
+
+**Where this leaves it:** the driver-capabilities fix is real and worth keeping as standard
+practice for every future NVIDIA test (`NVIDIA_DRIVER_CAPABILITIES=all` on every `docker run` from
+now on) — it moved the failure from a vague dead end to a precise, understood one. But it also
+closes off the hope that this was ever going to be a config-level fix: Android's guest-side gralloc
+genuinely cannot talk to NVIDIA's driver directly, cross-libc, cross-namespace. That's exactly the
+class of problem `waydroid-nvidia`'s Venus-proxy architecture (see two entries above) was built to
+sidestep — route rendering through a host-side process that *can* load NVIDIA's real stack,
+instead of expecting the Android guest to do it directly. It remains the strongest lead, now with
+direct confirmation (not just analogy) that the guest-direct path is a dead end on this stack.
