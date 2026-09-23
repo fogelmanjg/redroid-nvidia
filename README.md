@@ -143,24 +143,25 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       socket against the real RTX 4060:
       `PASS: 65536 elements computed correctly on 'Virtio-GPU Venus (NVIDIA GeForce RTX 4060)'`.
       See DEVLOG for the full story including the kernel-module swap.
-- [ ] **Tier 4 — Real integration into redroid, in progress — buffer allocation genuinely fixed.**
-      Found redroid ships *two* gralloc HALs side by side as prebuilts: `gralloc.gbm.so` (Mesa, no
-      NVIDIA support) and `gralloc.cros.so` (minigbm's real backend-dispatch system) —
-      `gpu_config.sh` never selected `cros`. Wrote a new minigbm backend registered for driver name
-      `nvidia-drm` (first pass: generic KMS dumb buffers, CPU-mappable only — a cheap canary before
-      the real GPU-accelerated vtest backend), built it with Soong, patched `gpu_config.sh` to
-      select `cros` for NVIDIA. Hit and fixed two real missing-library issues along the way
-      (`libdmabufheap.so` blocked by a linker namespace quirk, worked around by placing a
-      same-partition copy in `/vendor`; `libdrm.so` vs. this image's versioned `libdrm.so.2`,
-      fixed with a symlink) — **and with both fixed, `gralloc.cros.so` genuinely loads and
-      allocates**: `MESA: Using gralloc0 CrOS API`, no more dlopen failures, `vendor.gralloc-2-0`
-      no longer crash-loops. This is the real fix for the buffer-allocation half of the wall
-      chased since Tier 0. `surfaceflinger` still crashes, but at a later, different, expected
-      point now — `ro.hardware.egl=mesa` still has no NVIDIA backend, since gralloc and EGL are
-      separate components and only gralloc has been fixed so far. Remaining, precisely scoped:
-      extend the canary into the real vtest/Venus GPU allocator, and switch to
-      `ro.hardware.egl=angle` + Venus props (already proven standalone in Tier 3) so EGL talks to
-      the same host renderer. See DEVLOG for the full story.
+- [ ] **Tier 4 — ⭐ Real integration into redroid — both halves of the Tier 0 wall now cracked.**
+      redroid ships *two* gralloc HALs as prebuilts: `gralloc.gbm.so` (Mesa, no NVIDIA support) and
+      `gralloc.cros.so` (minigbm's real backend-dispatch system) — `gpu_config.sh` never selected
+      `cros`. Wrote a real minigbm backend (`nvidia_venus.c`, driver name `nvidia-drm`) allocating
+      over the same vtest wire protocol proven standalone in Tier 3, patched `gpu_config.sh` to
+      select `cros` + `ro.hardware.egl=angle` + Venus props (`ro.hardware.vulkan=virtio`,
+      `mesa.vn.debug=vtest`, `mesa.vtest.socket.name=...`) for NVIDIA, fixed two real missing-
+      library issues (`libdmabufheap.so` via a same-partition vendor copy, `libdrm.so` via a
+      symlink to this image's versioned `libdrm.so.2`). **Result**: `gralloc.cros.so` genuinely
+      loads and allocates (`Using gralloc0 CrOS API`, no more crash loop) — the allocation half of
+      the wall from Tier 0. Then, deployed against a real `virgl_test_server` with the vtest
+      socket bind-mounted into the container: **SurfaceFlinger's RenderEngine genuinely stands up
+      a Vulkan device against the real GPU through Venus and reports it by name** —
+      `ANGLE (NVIDIA, Vulkan 1.1.274 (NVIDIA Virtio-GPU Venus (NVIDIA GeForce RTX 4060)))` — the
+      "no suitable EGLConfig" abort chased since Tier 0 is completely gone. Still crashes, but
+      three steps deeper, in Android's shader-cache-priming step (`output buffer not gpu
+      writeable`) — a scoped, debuggable flag-mapping bug in this backend's own `bo_create()`
+      (not correctly signaling "real renderable buffer" vs. "CPU-mappable" for that specific
+      call), not an architectural wall. See DEVLOG for the full story.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —

@@ -603,3 +603,65 @@ same `virgl_test_server`/`virgl_render_server` host process already confirmed wo
 real RTX 4060. Next concrete step: extend the dumb-buffer backend into the real vtest-based GPU
 allocator (the actual point of Tier 4), and set the EGL/Vulkan props alongside it, so gralloc and
 EGL are both talking to the same host renderer instead of gralloc alone.
+
+## 2026-09-23 (same day) — Tier 4: real Venus-backed gralloc, and RenderEngine genuinely stands up Vulkan on the RTX 4060
+
+Rewrote the backend for real. Yesterday's dumb-buffer canary proved the write→build→deploy loop;
+today it got replaced with an actual minigbm `struct backend` (`nvidia_venus.c`, registered as
+`backend_nvidia_venus` for driver name `nvidia-drm`, replacing the dumb-buffer registration
+entirely so there's no name collision) that allocates over the same vtest wire protocol confirmed
+standalone in Tier 3 (`VCMD_CREATE_RENDERER` handshake, `VCMD_RESOURCE_ALLOC_GPU`, fd received via
+`SCM_RIGHTS`) — this time implemented against minigbm's real `bo_create`/`bo_import`/`bo_destroy`/
+`bo_map`/`bo_unmap`/`resource_info` callbacks instead of a bespoke vtable, so it's a genuine
+backend the rest of minigbm's dispatch and the cros_gralloc mapper layer treat like any other.
+Read `<sys/system_properties.h>` value `mesa.vtest.socket.name` directly, matching the same
+property name Venus's Vulkan side already uses — one socket, one property, both sides agree on it
+without any new plumbing.
+
+Also patched `gpu_config.sh` further: `setup_vulkan()` gained an `nvidia-drm` case setting
+`ro.hardware.vulkan=virtio` + `mesa.vn.debug=vtest` + `mesa.vtest.socket.name=/dev/venus/venus.sock`
+(mirroring `waydroid-nvidia`'s own architecture doc), and `gpu_setup_host()` now sets
+`ro.hardware.egl=angle` specifically for `nvidia-drm` instead of `mesa` — ANGLE-on-Venus is the
+real GPU path, matching Tier 2's research.
+
+Built clean with Soong (confirmed the actual exit code explicitly this time, not just the tail of
+a piped command — yesterday's silent failure taught that lesson). Deployed against a real
+`virgl_test_server` this time run with `--multi-clients` (a real boot makes several sequential
+connections, unlike the one-shot Tier 3 probe), with its socket bind-mounted from the host into
+the container at `/dev/venus/venus.sock` via a shared directory — no code needed to know
+Docker exists, just a systeem property naming a path both sides serve.
+
+Also carried forward the two library fixes from earlier today (`libdmabufheap.so` copied into
+`/vendor/lib*`, `libdrm.so` symlinked to `libdrm.so.2`) — a fresh container needs both every time,
+they're not something the build itself produces.
+
+**Result — real, measured progress on the actual goal, not a canary this time**:
+
+```
+ANGLE: Renderer (Vulkan 1.1.274 (NVIDIA Virtio-GPU Venus (NVIDIA GeForce RTX 4060) (0x00002808)))
+RenderEngine: renderer: ANGLE (NVIDIA, Vulkan 1.1.274 (... RTX 4060 ...), NVIDIA-24.0.0.8)
+```
+
+The "no suitable EGLConfig found" abort from every earlier attempt is **completely gone**.
+SurfaceFlinger's RenderEngine now genuinely creates a Vulkan device against the real GPU through
+Venus and reports its real name — the EGL/rendering half of the wall chased since Tier 0 is now
+also cracked, not just the gralloc/allocation half from earlier today. The host renderer log
+confirms it isn't a fluke: `vtest_gpu_alloc: allocating on "NVIDIA GeForce RTX 4060"` — a real
+allocation request reached the host and was serviced.
+
+**Still crashes, but three steps deeper and in a precisely diagnosable place**:
+
+```
+Abort message: 'output buffer not gpu writeable'
+  SkiaRenderEngine::drawLayersInternal -> drawHolePunchLayer -> Cache::primeShaderCache
+```
+
+This is Android's shader-cache-priming step doing a real test draw into a gralloc-allocated
+buffer, and Skia's own Vulkan import path asserting the buffer isn't usable as a render target.
+Scoped to this backend's own `bo_create()`: the `VCMD_ALLOC_GPU_FLAG_MAPPABLE` flag translation
+logic (or the `format_modifier` reported back through `resource_info()`) isn't correctly
+distinguishing "real GPU-renderable buffer" from "CPU-mappable buffer" for whatever `use_flags`
+combination this specific priming call passes — not a mystery, a debuggable flag-mapping bug in
+code written today, not an architectural wall. Next step: trace exactly which `use_flags` this
+call passes and fix the mapping so a genuinely renderable (non-mappable, real modifier) buffer
+comes back for it.
