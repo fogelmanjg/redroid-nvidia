@@ -837,3 +837,63 @@ reliably, or add a temporary printf directly in `vn_android_image_from_anb_inter
 local, buildable Mesa source, same NDK/build path already used for `vulkan.virtio.so` in
 `waydroid-nvidia`'s own `build/mesa/build.sh` recipe) to nail the exact call that returns
 non-`VK_SUCCESS`.
+
+## 2026-09-23 (same day) — Build environment for Mesa is ready; traced the real call chain across three codebases; the exact rejection point still isn't pinned down, and now we know why
+
+Set up what's actually needed to build Mesa's guest Venus driver from source, matching
+`waydroid-nvidia`'s own documented recipe: installed `meson`/`ninja` on the host, downloaded
+Android NDK r27c to `/opt/android-ndk` (this AOSP checkout's own bundled
+`prebuilts/ndk/current/` turned out to be headers/sources only, no actual toolchain binaries —
+the real NDK needs to come from Google directly). Confirmed the local `external/mesa3d` checkout
+here is a genuine, clean git tree (AOSP's own upstream mirror) that should work directly with
+`waydroid-nvidia`'s meson cross-file recipe without needing a separate clone.
+
+**Before spending a build cycle, traced the real call chain by hand across three separate
+codebases (Mesa, AOSP frameworks, ANGLE) — this by itself corrected a wrong assumption from
+earlier tonight**: the crash goes through `EGL_NATIVE_BUFFER_ANDROID`, which in ANGLE's Vulkan
+backend (`DisplayVkAndroid::createExternalImageSibling`,
+`external/angle/src/libANGLE/renderer/vulkan/android/`) is handled by
+`HardwareBufferImageSiblingVkAndroid` — genuinely the **AHardwareBuffer** import path
+(`vkGetAndroidHardwareBufferPropertiesANDROID`), not the ANB/WSI-swapchain path
+(`vn_android_image_from_anb`) chased earlier — those are two different Vulkan mechanisms that
+happen to share the word "native buffer." `ValidateHardwareBuffer`/`initImpl` in
+`HardwareBufferImageSiblingVkAndroid.cpp` confirmed `EGL_BAD_PARAMETER` (`0x300c`) is ANGLE's
+*generic* fallback for any non-`VK_SUCCESS` result here — it doesn't distinguish which underlying
+Vulkan call actually failed, which is exactly why the EGL-level error alone couldn't localize
+anything further.
+
+**Checked the two real prerequisites for Venus even offering the AHardwareBuffer extension**,
+since `vn_physical_device_get_native_extensions()` only sets
+`ANDROID_external_memory_android_hardware_buffer = true` when the *renderer* (the host side)
+exposes both `EXT_image_drm_format_modifier` and `EXT_queue_family_foreign`. Wrote a tiny
+standalone probe (`list_exts.c`, ~30 lines) reusing the exact same Tier 3 vtest connection method
+— no Android boot needed — enumerating `vkEnumerateDeviceExtensionProperties` over the real
+Venus/vtest connection. **Both prerequisites are confirmed present**, ruling that out cleanly.
+(The probe's own report that `ANDROID_external_memory_android_hardware_buffer` itself is absent is
+expected and uninformative — it's gated behind `#if DETECT_OS_ANDROID`, true only in the real NDK
+Android build, not in this Debian-packaged `libvulkan_virtio.so` used for the standalone test.)
+
+**Found why every earlier `vn_log` grep came up empty, and it isn't the log content**:
+`vn_log()` (`vn_common.c`) tags every message `"MESA-VIRTIO"` at `MESA_LOG_DEBUG` priority — not
+`"anb"`, `"vn_android"`, or `"u_gralloc"` as I'd been grepping for (those are inside the *message
+text*, which should still substring-match — but a completely clean, tag-scoped, verbose-priority
+query (`logcat -d -s MESA-VIRTIO:V`) *also* came up completely empty). Since `MESA-VIRTIO`-tagged
+lines are real and appear elsewhere in this same project's history (Tier 0's original crash logs
+show them), their total absence here is itself the real finding: **none of `vn_android.c`'s
+existing `vn_log()` call sites are being reached at all** for this failure — not the ones in
+`vn_android_gralloc_get_buffer_properties`, not the ones in `vn_android_get_ahb_format_properties`,
+not the ones in `vn_android_image_from_anb_internal`. The rejection happens *before* any of them —
+either inside ANGLE's own code prior to calling into Mesa, or in a Mesa function this session
+hasn't read yet.
+
+**Where this leaves it**: three codebases now understood in real detail (ANGLE's dispatch,
+Venus's extension negotiation confirmed correctly wired end to end, AOSP's u_gralloc→gralloc0
+bridge), the actual failure point still not pinned to a line — but for a well-understood, now much
+narrower reason (wrong log tag assumption, corrected) rather than an open mystery. The build
+environment is ready and waiting; next session's most direct move is a real Mesa build with a
+`fprintf(stderr, ...)` dropped at the very top of `HardwareBufferImageSiblingVkAndroid::initImpl`
+peers on the ANGLE side (also locally buildable, `external/angle`) and/or at the top of
+`vn_GetAndroidHardwareBufferPropertiesANDROID`'s actual entry point on the Mesa side (not yet
+located — `vn_android_get_ahb_format_properties` is the *helper*, not the public Vulkan entry
+point that calls it) — bypassing Android's log-level system entirely, since it's demonstrably not
+reliable for this specific investigation.

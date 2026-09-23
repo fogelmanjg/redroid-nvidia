@@ -164,11 +164,20 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       logging; SurfaceFlinger's RenderEngine stands up a real Vulkan device against the GPU through
       Venus (`ANGLE (NVIDIA, Vulkan 1.1.274 (NVIDIA Virtio-GPU Venus (NVIDIA GeForce RTX 4060)))`).
       **The wall moved one level deeper**: `Could not create EGL image, err = (0x300c)`
-      (`EGL_BAD_PARAMETER`), traced to ANGLE's own `eglCreateImageKHR`/AHardwareBuffer import,
-      likely hinging on whether Venus's guest Vulkan driver implements
-      `VK_ANDROID_external_memory_android_hardware_buffer` — a different extension than the
-      `VK_EXT_external_memory_dma_buf` path already proven working for host-side allocation. A
-      real architecture question, not a rabbit hole. See DEVLOG for the full trail, bug by bug.
+      (`EGL_BAD_PARAMETER`) — traced by hand across three codebases (ANGLE, Mesa/Venus, AOSP's
+      `u_gralloc`/gralloc0 bridge). Confirmed `EGL_NATIVE_BUFFER_ANDROID` in ANGLE really is the
+      AHardwareBuffer import path (`HardwareBufferImageSiblingVkAndroid`), that `0x300c` is
+      ANGLE's own generic fallback for *any* underlying Vulkan failure there, and — via a small
+      standalone probe reusing Tier 3's connection method, no Android boot needed
+      ([`tests/list_exts.c`](tests/list_exts.c)) — that both prerequisites Venus checks before
+      advertising `VK_ANDROID_external_memory_android_hardware_buffer`
+      (`EXT_image_drm_format_modifier`, `EXT_queue_family_foreign`) genuinely reach the guest.
+      The exact rejection point inside Mesa still isn't pinned to a line — traced far enough to
+      know it's *not* any of `vn_android.c`'s existing log call sites (confirmed by their total
+      absence, correctly tag-scoped, ruling out an earlier wrong log-tag assumption) — but the
+      real Mesa build environment (NDK, meson, this project's own Mesa checkout) is now set up and
+      ready for a source-level instrumented build next session. Not a rabbit hole — three real,
+      independently confirmed facts closer to the answer. See DEVLOG for the full trail, bug by bug.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
