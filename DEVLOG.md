@@ -534,3 +534,72 @@ simpler allocation path (avoiding the new dependency entirely) that the original
 clearly built with, or (2) fix the actual VINTF/linkerconfig namespace rule to expose
 `libdmabufheap.so` to `sphal`. Real, understood, scoped blocker — not a mystery — paused here for
 the day.
+
+## 2026-09-23 — Tier 4: gralloc actually loads and allocates — the wall moved to EGL, exactly where expected
+
+Picked back up on `jgustavo48` (Wake-on-LAN from `jgustavo-server01`, same LAN — reloaded
+`loop`/`ext4`/`binder` and re-chmod'd the binder nodes, none of which survive a reboot).
+
+**Path 1 from yesterday (find a Soong flag to skip `libdmabufheap`) turned out to be a dead end,
+checked rather than assumed**: removed it from `minigbm_cros_gralloc_defaults`'s `shared_libs` and
+rebuilt — real compile failure, `cros_gralloc_driver.h` genuinely `#include`s
+`BufferAllocator/BufferAllocator.h` from that library. Yesterday's "nothing in the source
+references it" check was wrong because it grepped for the string `dmabufheap`, and the actual
+usage is via that header path and a `BufferAllocator` class name — neither contains that
+substring. Reverted the removal immediately; lesson logged so the same mistake doesn't repeat.
+
+**Path 2 (fix the namespace) also didn't pan out as expected, but a simpler fix did**: added
+`libdmabufheap.so` to `/system/etc/llndk.libraries.txt` and rebooted a fresh container — the
+generated `/linkerconfig/ld.config.txt` **did not change at all**; grepping it for `dmabufheap`
+came back completely empty, meaning `linkerconfig` isn't sourcing the `sphal` namespace's allowed
+list from that plain text file the way its LLNDK role would suggest (or something else about this
+image's boot path bypasses that step) — not fully understood, and not worth the time to fully
+understand tonight. Skipped straight to the pragmatic fix instead: **same-partition libraries never
+cross the namespace boundary at all**, already proven by `libgralloctypes.so` (present on both
+`/system` and `/vendor`, never triggered the error). Copied `libdmabufheap.so` (both ABIs) from
+`/system/lib*/` straight into `/vendor/lib*/` before boot. That one error disappeared completely.
+
+**A second, different missing library then surfaced** (progress, not a regression):
+`gralloc.cros.so` also wants plain `libdrm.so`, while this image only ships the versioned
+`libdrm.so.2` (the original prebuilt was built against that older SONAME convention; this Soong
+config's default emits the newer unversioned one). Same fix shape, cheaper this time — no need to
+copy a whole library, just `ln -s libdrm.so.2 libdrm.so` in both vendor lib dirs; same real ABI,
+different name. Created live on an already-crash-looping container and picked up on the very next
+restart attempt, no reboot needed.
+
+**With both fixed, `gralloc.cros.so` genuinely loads and works**:
+
+```
+MESA: Using gralloc0 CrOS API
+```
+
+No more `vndksupport`/`dlopen failed` anywhere in the log — a real, clean load, confirmed on
+several consecutive service restarts. `vendor.gralloc-2-0` no longer exits with status 1 at all.
+**This is the actual fix for the bug chased since Tier 0** — the buffer-allocation half of the
+NVIDIA wall is closed: minigbm's real backend dispatch (`drv_get_backend()` matching `nvidia-drm`)
+now succeeds where Mesa's own GBM never could.
+
+**`surfaceflinger` still crashes — but at a different, later, and expected point**:
+
+```
+Abort message: 'no suitable EGLConfig found, giving up (... vendor: Android ... Client API: OpenGL_ES)'
+```
+
+This is architecturally correct and not a setback: gralloc (buffer *allocation*) and EGL
+(GPU *rendering*) are separate components. Fixing gralloc only closes half the wall from Tier 0 —
+`ro.hardware.egl` is still `mesa` (`gpu_setup_host()` never touches it), so SurfaceFlinger's
+RenderEngine is still asking Mesa's own EGL/GBM implementation to create a context, which still
+has no NVIDIA backend, for the exact reason established back in Tier 0. The dumb-buffer canary
+backend was never meant to produce real 3D acceleration by itself — it was built specifically to
+validate the write→build→deploy loop cheaply before writing the real vtest/Venus backend. It did
+exactly that, and did it while also landing a genuine, permanent fix (buffer allocation actually
+works now).
+
+**Where this leaves it, precisely scoped**: the remaining wall is EGL/rendering only, and the fix
+shape is already known and already proven standalone in Tier 3 — `ro.hardware.egl=angle` (already
+shipped in this image) on top of Venus (`ro.hardware.vulkan=virtio`, `mesa.vn.debug=vtest`,
+`mesa.vtest.socket.name=...`, matching `waydroid-nvidia`'s own architecture doc) talking to the
+same `virgl_test_server`/`virgl_render_server` host process already confirmed working against the
+real RTX 4060. Next concrete step: extend the dumb-buffer backend into the real vtest-based GPU
+allocator (the actual point of Tier 4), and set the EGL/Vulkan props alongside it, so gralloc and
+EGL are both talking to the same host renderer instead of gralloc alone.

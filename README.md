@@ -143,23 +143,24 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       socket against the real RTX 4060:
       `PASS: 65536 elements computed correctly on 'Virtio-GPU Venus (NVIDIA GeForce RTX 4060)'`.
       See DEVLOG for the full story including the kernel-module swap.
-- [ ] **Tier 4 — Real integration into redroid, in progress.** Checked whether
-      `waydroid-nvidia`'s own guest-Android release could shortcut this the way the host release
-      did for Tier 3 — it can't (their `libgbm_mesa_wrapper.so` needs their own patched gralloc
-      dispatcher, which redroid doesn't have). Found the real target instead: redroid ships *two*
-      gralloc HALs side by side as prebuilts, `gralloc.gbm.so` (Mesa, no NVIDIA support) and
-      `gralloc.cros.so` (genuinely minigbm's real backend-dispatch system, confirmed via a local
-      AOSP checkout for this exact build) — `gpu_config.sh` just never selects `cros`. Wrote a new
-      minigbm backend registered for driver name `nvidia-drm` (first pass: generic KMS dumb
-      buffers, CPU-mappable only, as a cheap canary before the real GPU-accelerated vtest backend),
-      **built it successfully end to end with Soong** inside the project's existing build
-      container, and patched `gpu_config.sh` to select `cros` specifically when NVIDIA is detected.
-      Deployed for a real test: a new, different, more specific failure — `libdmabufheap.so` genuinely
-      exists on the system partition but Android's linker **namespace** isolation won't expose it to
-      the vendor HAL's `sphal` namespace. This build's default minigbm Soong config pulls in newer
-      Gralloc4-style dependencies the original prebuilt never needed. Real, scoped blocker, not a
-      mystery — either find the Soong flag for the simpler allocation path, or fix the namespace
-      rule. See DEVLOG for the full build story.
+- [ ] **Tier 4 — Real integration into redroid, in progress — buffer allocation genuinely fixed.**
+      Found redroid ships *two* gralloc HALs side by side as prebuilts: `gralloc.gbm.so` (Mesa, no
+      NVIDIA support) and `gralloc.cros.so` (minigbm's real backend-dispatch system) —
+      `gpu_config.sh` never selected `cros`. Wrote a new minigbm backend registered for driver name
+      `nvidia-drm` (first pass: generic KMS dumb buffers, CPU-mappable only — a cheap canary before
+      the real GPU-accelerated vtest backend), built it with Soong, patched `gpu_config.sh` to
+      select `cros` for NVIDIA. Hit and fixed two real missing-library issues along the way
+      (`libdmabufheap.so` blocked by a linker namespace quirk, worked around by placing a
+      same-partition copy in `/vendor`; `libdrm.so` vs. this image's versioned `libdrm.so.2`,
+      fixed with a symlink) — **and with both fixed, `gralloc.cros.so` genuinely loads and
+      allocates**: `MESA: Using gralloc0 CrOS API`, no more dlopen failures, `vendor.gralloc-2-0`
+      no longer crash-loops. This is the real fix for the buffer-allocation half of the wall
+      chased since Tier 0. `surfaceflinger` still crashes, but at a later, different, expected
+      point now — `ro.hardware.egl=mesa` still has no NVIDIA backend, since gralloc and EGL are
+      separate components and only gralloc has been fixed so far. Remaining, precisely scoped:
+      extend the canary into the real vtest/Venus GPU allocator, and switch to
+      `ro.hardware.egl=angle` + Venus props (already proven standalone in Tier 3) so EGL talks to
+      the same host renderer. See DEVLOG for the full story.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
