@@ -665,3 +665,54 @@ combination this specific priming call passes — not a mystery, a debuggable fl
 code written today, not an architectural wall. Next step: trace exactly which `use_flags` this
 call passes and fix the mapping so a genuinely renderable (non-mappable, real modifier) buffer
 comes back for it.
+
+## 2026-09-23 (same day) — Chasing "output buffer not gpu writeable" further: real per-call evidence, ruled out the easy explanations
+
+Added logging (`__android_log_print`, tag `nvidia_venus`) directly to `bo_create()` to see the
+real `use_flags` per call instead of guessing. Real data, not a repeat: the failing buffer is a
+**720x1280 buffer, `use_flags=0x25`** (`BO_USE_SCANOUT | BO_USE_RENDERING | BO_USE_TEXTURE`) — a
+genuine render request, correctly translated to `alloc_flags=0x2` (SCANOUT only, **not**
+MAPPABLE) — which should route to the host's real GPU-renderable Vulkan-image path, not the
+CPU/udmabuf one (confirmed by reading `virglrenderer-vtest/vtest_gpu_alloc.c`: the two paths are
+entirely separate functions, `vtest_gpu_alloc_gpu()` vs `_cpu()`, selected purely by that flag).
+The backend logs `bo_create 720x1280: OK fd=8 stride=2880` — success, from inside
+`vendor.gralloc-2-0`'s own process — no error anywhere in the allocation path itself.
+
+**Read the actual AOSP assertion source** (`RenderEngine::validateOutputBufferUsage`,
+`frameworks/native/libs/renderengine/RenderEngine.cpp`): it checks
+`buffer->getUsage() & GraphicBuffer::USAGE_HW_RENDER` on the `GraphicBuffer` C++ object itself —
+and `GraphicBuffer::initWithSize()` only sets that field from the *original caller's requested*
+usage, and only `if (err == NO_ERROR)` from the allocator. Traced the actual call site
+(`Cache::primeShaderCache`, `frameworks/native/libs/renderengine/skia/Cache.cpp:704-708`): the
+failing buffer (`dstBuffer`) is explicitly constructed with
+`GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE` — the request itself is correct.
+
+**Tried the obvious mitigation, found it doesn't work — and *why* it doesn't is itself real
+information**: `SurfaceFlinger.cpp` exposes real, official properties
+(`debug.sf.prime_shader_cache.hole_punch`, `.solid_layers`, etc.) gating each individual priming
+draw. Set all of them to `false` for the `nvidia-drm` case. Result: the crash's backtrace offset
+*shifted* (skipped past `drawHolePunchLayer`, as expected) but the **identical** abort still fires
+from a *different* draw call moments later. Checked `Cache.cpp` exhaustively: `dstTexture` (the
+same buffer) is used by well over a dozen draw calls, several unconditional
+(`drawBlurLayers` gated only by `renderengine->supportsBackgroundBlur()`, not any settable prop)
+or gated by properties that don't cover every path. **This rules out "some priming step doesn't
+handle this buffer correctly"** — every single draw into this specific buffer fails identically,
+which means the buffer itself never becomes genuinely GPU-writable in the first place, regardless
+of which code tries to use it first. Disabling priming steps one at a time was never going to be
+the real fix; reverted that framing.
+
+**Where this leaves it, honestly**: allocation succeeds (my code, confirmed), the request is
+correct (AOSP's code, confirmed), and yet the resulting buffer isn't usable as a render target by
+the time ANGLE/Skia gets to it. The likely remaining suspects, not yet checked: (1) something in
+`cros_gralloc_buffer.cc`'s own post-allocation handling that doesn't correctly carry render
+capability into the `native_handle_t`/AHardwareBuffer descriptor for a *non-DRI* backend it wasn't
+originally written against (every existing minigbm backend is a real local DRM driver;
+`nvidia_venus` is the first one whose buffers come from a remote process entirely — some assumption
+elsewhere in that gralloc layer may implicitly expect that), or (2) something ANGLE's own Vulkan
+image-import path checks on the `AHardwareBuffer` (via
+`vkGetAndroidHardwareBufferPropertiesANDROID`-style queries) that this backend's buffer doesn't
+satisfy even though its Vulkan-side allocation on the host was created with the right
+`VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT`. A real, narrower, well-evidenced next step — not a
+rabbit hole — for the next session: instrument or trace the cros_gralloc→AHardwareBuffer→ANGLE
+import path specifically, since both endpoints (host-side Vulkan image creation, backend's own
+`bo_create`) are now independently confirmed correct.

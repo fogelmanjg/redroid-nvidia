@@ -157,11 +157,18 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       socket bind-mounted into the container: **SurfaceFlinger's RenderEngine genuinely stands up
       a Vulkan device against the real GPU through Venus and reports it by name** —
       `ANGLE (NVIDIA, Vulkan 1.1.274 (NVIDIA Virtio-GPU Venus (NVIDIA GeForce RTX 4060)))` — the
-      "no suitable EGLConfig" abort chased since Tier 0 is completely gone. Still crashes, but
-      three steps deeper, in Android's shader-cache-priming step (`output buffer not gpu
-      writeable`) — a scoped, debuggable flag-mapping bug in this backend's own `bo_create()`
-      (not correctly signaling "real renderable buffer" vs. "CPU-mappable" for that specific
-      call), not an architectural wall. See DEVLOG for the full story.
+      "no suitable EGLConfig" abort chased since Tier 0 is completely gone. Still crashes, in
+      Android's shader-cache-priming step (`output buffer not gpu writeable`) — **investigated
+      further and ruled out the easy explanations**: the allocation genuinely succeeds
+      (confirmed via added logging: real render-capable request, real success, real fd), the
+      request itself is correct (traced to AOSP's own `Cache.cpp`, which explicitly asks for
+      `GRALLOC_USAGE_HW_RENDER`), and disabling shader-cache priming step by step (real, official
+      `debug.sf.prime_shader_cache.*` properties) doesn't fix it — the same buffer fails identically
+      no matter which of the dozen+ draw calls touches it first, meaning the buffer itself never
+      becomes genuinely GPU-writable, not a priming-step-specific bug. Next, well-scoped step:
+      trace the `cros_gralloc_buffer.cc` → AHardwareBuffer → ANGLE Vulkan-import path specifically,
+      since both endpoints (host-side Vulkan image creation, this backend's own allocation) are now
+      independently confirmed correct. See DEVLOG for the full trail.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
