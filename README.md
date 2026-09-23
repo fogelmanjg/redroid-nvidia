@@ -184,8 +184,8 @@ Even if it doesn't go further, each tier on its own is a publishable contributio
 ## Why a separate repo
 
 redroid-hwenc went from "nobody has published a fix in 4 years" to a real, working, two-vendor
-solution — see [its DEVLOG](https://github.com/fogelmanjg/redroid-hwenc/blob/main/DEVLOG.md) for
-exactly how, session by session, bugs and all. This is the same kind of problem, for a GPU vendor
+solution — see [redroid-hwenc's own DEVLOG](https://github.com/fogelmanjg/redroid-hwenc/blob/main/DEVLOG.md)
+(a different repo than this one) for exactly how, session by session, bugs and all. This is the same kind of problem, for a GPU vendor
 where the starting line is further back. Separate repo because the actual technical work is
 unrelated (this is about rendering/gralloc first, not encode), but the same intent: solve it in
 public, document the real process — including the dead ends — as it happens.
