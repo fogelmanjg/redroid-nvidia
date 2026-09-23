@@ -1,0 +1,77 @@
+diff --git a/Android.bp b/Android.bp
+index 57f44d5..65dfa77 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -45,6 +45,7 @@ filegroup {
+         "i915.c",
+         "mediatek.c",
+         "msm.c",
++        "nvidia_venus.c",
+         "rockchip.c",
+         "vc4.c",
+         "virtgpu.c",
+diff --git a/cros_gralloc/cros_gralloc_driver.cc b/cros_gralloc/cros_gralloc_driver.cc
+index cb8b94b..66b3337 100644
+--- a/cros_gralloc/cros_gralloc_driver.cc
++++ b/cros_gralloc/cros_gralloc_driver.cc
+@@ -342,10 +342,18 @@ int32_t cros_gralloc_driver::allocate(const struct cros_gralloc_buffer_descripto
+ 		goto destroy_hnd;
+ 	}
+ 
+-	ret = buffer->initialize_metadata(descriptor);
+-	if (ret) {
+-		ALOGE("Failed to allocate: failed to initialize cros_gralloc_buffer metadata.");
+-		goto destroy_hnd;
++	/*
++	 * initialize_metadata() writes into the reserved region created above -
++	 * only meaningful (and only actually created) when the caller asked for
++	 * one. Calling it unconditionally fails every allocation whose caller
++	 * doesn't request metadata_fd support, independent of any backend.
++	 */
++	if (descriptor->enable_metadata_fd) {
++		ret = buffer->initialize_metadata(descriptor);
++		if (ret) {
++			ALOGE("Failed to allocate: failed to initialize cros_gralloc_buffer metadata.");
++			goto destroy_hnd;
++		}
+ 	}
+ 
+ 	{
+@@ -366,7 +374,15 @@ destroy_hnd:
+ 	native_handle_close(hnd);
+ 	native_handle_delete(hnd);
+ 
+-	drv_bo_destroy(bo);
++	/*
++	 * If `buffer` was already constructed (the goto came from the
++	 * initialize_metadata() failure below, not an earlier one), its own
++	 * destructor calls drv_bo_destroy(bo) when it goes out of scope on
++	 * return - doing it again here double-destroys bo. Only destroy it
++	 * explicitly when nothing else owns it yet.
++	 */
++	if (!buffer)
++		drv_bo_destroy(bo);
+ 	return ret;
+ }
+ 
+diff --git a/drv.c b/drv.c
+index 7fd2250..7cceb46 100644
+--- a/drv.c
++++ b/drv.c
+@@ -47,6 +47,7 @@ extern const struct backend backend_marvell;
+ extern const struct backend backend_mediatek;
+ extern const struct backend backend_meson;
+ extern const struct backend backend_nouveau;
++extern const struct backend backend_nvidia_venus;
+ extern const struct backend backend_komeda;
+ extern const struct backend backend_radeon;
+ extern const struct backend backend_rockchip;
+@@ -72,7 +73,7 @@ static const struct backend *drv_backend_list[] = {
+ 	&backend_vc4,
+ #endif
+ 	&backend_evdi,	    &backend_komeda,	&backend_marvell, &backend_mediatek,
+-	&backend_meson,	    &backend_nouveau,	&backend_radeon,  &backend_rockchip,
++	&backend_meson,	    &backend_nouveau,	&backend_nvidia_venus, &backend_radeon,  &backend_rockchip,
+ 	&backend_sun4i_drm, &backend_synaptics, &backend_udl,	  &backend_virtgpu,
+ 	&backend_vkms,	    &backend_mock
+ };

@@ -716,3 +716,86 @@ satisfy even though its Vulkan-side allocation on the host was created with the 
 rabbit hole — for the next session: instrument or trace the cros_gralloc→AHardwareBuffer→ANGLE
 import path specifically, since both endpoints (host-side Vulkan image creation, backend's own
 `bo_create`) are now independently confirmed correct.
+
+## 2026-09-23 (same day) — Three real, root-cause bugs found and fixed; the wall moves to Vulkan/EGL native-buffer import
+
+Picked the trail back up with the exact plan the last entry laid out: trace the import path
+directly instead of guessing further. Found three separate, real, independently-confirmed bugs,
+each one exposing the next once fixed — this is the real story of why "output buffer not gpu
+writeable" resisted every earlier theory: it was never one bug, it was three stacked in a row,
+and each earlier fix attempt was correct but insufficient because the *next* one masked the result.
+
+**Bug 1 — `bo->handle` held a raw fd, not a GEM handle (this backend's own bug).** Reread
+`drv_bo_get_plane_fd()` in `drv.c` line by line: it calls
+`drmPrimeHandleToFD(bo->drv->fd, bo->handle.u32, ...)` — meaning every minigbm backend is expected
+to store a real, *local* GEM handle in `bo->handle`, valid on this driver's own DRM fd, which
+`drv_bo_get_plane_fd()` re-exports to a fresh fd on demand. This backend was instead storing the
+raw fd received from the host directly as `bo->handle.s32` — a fd number, not a GEM handle,
+meaningless to `drmPrimeHandleToFD()` on this device. That call failed with ENOENT every single
+time, silently, and **this — not anything about the render request or Skia's shader-cache
+priming — was the actual original cause of "output buffer not gpu writeable" all along**: the
+allocation was failing deep inside `cros_gralloc_driver::allocate()` (`goto destroy_hnd`, no
+distinctive log at that exact site), so `GraphicBuffer::initWithSize()`'s `usage = inUsage` line
+never ran, `usage` stayed 0, and the later `validateOutputBufferUsage()` check failed for a buffer
+that was never actually allocated — not because it wasn't "gpu writeable" in any deeper sense.
+Fixed by importing the fd via `DRM_IOCTL_PRIME_FD_TO_HANDLE` into a real local GEM handle right
+in `bo_create()`, and switching `bo_import`/`bo_destroy`/`bo_unmap` to minigbm's own existing
+generic helpers (`drv_prime_bo_import`, `drv_gem_bo_destroy`, `drv_bo_munmap`) instead of
+reimplementing the same ioctls — they already do exactly this, correctly, and reusing them is both
+less code and a stronger correctness guarantee than a hand-rolled equivalent.
+
+**Bug 2 — a real double-free in AOSP's own `cros_gralloc_driver::allocate()`, never triggered
+before.** Fixing bug 1 let allocation proceed further than it ever had for this GPU — and hit a
+Scudo "invalid chunk state" heap-corruption abort in `allocator@2.0-s`. Traced the crash to
+`cros_gralloc_buffer::~cros_gralloc_buffer()` calling `drv_bo_destroy(bo_)` unconditionally
+(confirmed by reading its destructor directly) — and `allocate()`'s own `destroy_hnd:` cleanup
+label calls `drv_bo_destroy(bo)` *again*, explicitly, on the same `bo`, whenever a failure occurs
+*after* the local `buffer` unique_ptr already owns it (e.g. the `initialize_metadata()` failure
+path). Once `buffer` goes out of scope at the `return ret;` right after, its destructor destroys
+`bo` a second time. This is real AOSP source, unrelated to this backend, and had plausibly never
+fired before in this codebase because every previous NVIDIA attempt failed *earlier* (bug 1, before
+`buffer` was ever constructed) — genuinely new territory, first execution of this exact code path
+on this hardware. Fixed with a one-line guard: only call the explicit `drv_bo_destroy(bo)` at
+`destroy_hnd:` `if (!buffer)` — otherwise let the unique_ptr's own destructor handle it exactly
+once.
+
+**Bug 3 — `initialize_metadata()` called unconditionally, also real AOSP source, also newly
+exposed.** With the double-free fixed, allocation failed cleanly (no crash) with "Failed to
+initialize metadata: failed to get metadata region" → "Buffer does not have reserved region." —
+traced to `cros_gralloc_driver::allocate()` calling `buffer->initialize_metadata(descriptor)`
+unconditionally, while the reserved region backing that metadata is only ever created a few lines
+earlier `if (hnd->reserved_region_size > 0)`, itself gated on `descriptor->enable_metadata_fd`.
+When the caller (redroid's `gralloc0_alloc()` shim) doesn't request `enable_metadata_fd`, no
+region exists to initialize — and nothing ever checked that before trying. This is the clearest
+sign yet that `gralloc.cros.so` (minigbm's real backend dispatch) has plausibly **never been
+exercised through a real boot on this AOSP tree before** — every earlier redroid GPU
+(AMD, Intel) used Mesa's separate `gralloc.gbm.so` in host mode, never `cros`. Fixed by gating the
+`initialize_metadata()` call on the same `descriptor->enable_metadata_fd` condition already used
+for creating the region in the first place.
+
+**With all three fixed, buffer allocation is now genuinely, fully correct** — confirmed via the
+`nvidia_venus` logging: every real format/size combination the caller needs succeeds cleanly, no
+crashes, no silent failures; the only remaining "Failed to allocate" is a single harmless format
+probe (`format 59`, not one this backend registers support for, exactly as it should behave for
+an unsupported format on real hardware too).
+
+**The wall moved one level deeper, to Vulkan/EGL's own native-buffer import — a real, different,
+more specific problem than anything above**:
+
+```
+D skia: Could not create EGL image, err = (0x300c)   [EGL_BAD_PARAMETER]
+```
+
+traced through `GaneshBackendTexture` → `SkiaRenderEngine::mapExternalTextureBuffer` →
+`GrAHardwareBufferUtils::MakeGLBackendTexture` (confirmed via the `RenderEngine: ... SkiaGL Backend
+(Ganesh)` log line that GL, not Vulkan, is the active Ganesh backend here — meaning ANGLE's own
+`eglCreateImageKHR(..., EGL_NATIVE_BUFFER_ANDROID, ...)` is what's failing, internally, presumably
+by itself needing to import the AHardwareBuffer into *its own* Vulkan context via
+`VK_ANDROID_external_memory_android_hardware_buffer` — a genuinely different Vulkan extension than
+the `VK_EXT_external_memory_dma_buf` this whole pipeline (host allocation, Venus transport) is
+built around. ANGLE and Skia are both prebuilt/vendored-as-source-but-effectively-fixed here, so
+this isn't a bug in code written for this project — it's a real, substantive architecture question
+about whether Venus's guest-side Vulkan driver even implements/needs to implement the ANDROID
+hardware buffer external-memory extension for AHardwareBuffer reimport to work, distinct from the
+dma-buf path already proven working for host-side allocation. Not chased further tonight — a real
+frontier, not a rabbit hole, and a good place to pick back up.
