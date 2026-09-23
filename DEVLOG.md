@@ -799,3 +799,41 @@ about whether Venus's guest-side Vulkan driver even implements/needs to implemen
 hardware buffer external-memory extension for AHardwareBuffer reimport to work, distinct from the
 dma-buf path already proven working for host-side allocation. Not chased further tonight — a real
 frontier, not a rabbit hole, and a good place to pick back up.
+
+## 2026-09-23 (same day) — Traced one level further into Mesa itself: `vn_android.c` exists, the exact rejection point doesn't (yet)
+
+Checked the obvious first question before assuming Venus is missing the extension outright:
+`external/mesa3d/src/virtio/vulkan/vn_android.c` is real, present, ~1080 lines, with genuine
+`VK_ANDROID_external_memory_android_hardware_buffer` support code
+(`vn_android_image_from_anb`, `vn_android_get_ahb_format_properties`, etc.) — so this isn't a
+"Venus doesn't support AHardwareBuffer at all" situation. The extension exists; something more
+specific about *this* buffer is what it rejects.
+
+Traced the property-query chain it depends on: `vn_android_gralloc_get_buffer_properties()` calls
+Mesa's own `u_gralloc` abstraction, which for CrOS gralloc (`u_gralloc_cros_api.c`) dispatches to
+the legacy `gralloc_module_t::perform()` op `CROS_GRALLOC_DRM_GET_BUFFER_INFO` — implemented in
+`gralloc0.cc`'s `gralloc0_perform()`, which calls this backend's own `resource_info()` directly
+(confirmed by reading it) — a completely different, independent code path from the
+reserved-region/metadata machinery bugs 2 and 3 fixed earlier today. `vn_android`'s own check —
+`if (info.modifier == DRM_FORMAT_MOD_INVALID) { vn_log(...); return false; }` — would explain the
+failure exactly if it fired, but on paper this backend's `resource_info()` returns a real,
+non-invalid modifier value (whatever the host's `vkGetImageDrmFormatModifierPropertiesEXT`
+reported), so nothing here should trip it.
+
+**Checked empirically rather than trusting the paper trail**: redeployed (no rebuild needed —
+`vulkan.virtio.so` is an unmodified prebuilt) and grepped fresh logs for `vn_log`'s own output
+strings (`u_gralloc_get_buffer_basic_info failed`, `Unexpected DRM_FORMAT_MOD_INVALID`) around the
+`Could not create EGL image, err = (0x300c)` failure. **Neither appeared** — meaning either this
+exact branch isn't where the rejection happens, or Mesa's own logging at that call site is below
+whatever verbosity level reaches logcat by default (not yet confirmed which). Genuinely
+undetermined which, tonight — the honest state is "the failure is somewhere in or downstream of
+`vn_android_image_from_anb`, not yet isolated to a specific line," not "confirmed to be X."
+
+**Where this leaves it**: real progress in scope (ruled out the reserved-region/metadata bugs as
+the cause of *this* specific failure, confirmed the AHardwareBuffer-support code genuinely exists
+in this Mesa build), but the exact rejection point inside `vn_android.c`'s import chain is still
+open. Next session: either force Mesa's debug logging verbose enough to surface `vn_log` output
+reliably, or add a temporary printf directly in `vn_android_image_from_anb_internal` (this is
+local, buildable Mesa source, same NDK/build path already used for `vulkan.virtio.so` in
+`waydroid-nvidia`'s own `build/mesa/build.sh` recipe) to nail the exact call that returns
+non-`VK_SUCCESS`.
