@@ -172,12 +172,30 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       ([`tests/list_exts.c`](tests/list_exts.c)) — that both prerequisites Venus checks before
       advertising `VK_ANDROID_external_memory_android_hardware_buffer`
       (`EXT_image_drm_format_modifier`, `EXT_queue_family_foreign`) genuinely reach the guest.
-      The exact rejection point inside Mesa still isn't pinned to a line — traced far enough to
-      know it's *not* any of `vn_android.c`'s existing log call sites (confirmed by their total
-      absence, correctly tag-scoped, ruling out an earlier wrong log-tag assumption) — but the
-      real Mesa build environment (NDK, meson, this project's own Mesa checkout) is now set up and
-      ready for a source-level instrumented build next session. Not a rabbit hole — three real,
-      independently confirmed facts closer to the answer. See DEVLOG for the full trail, bug by bug.
+      **Then found the "real Vulkan device" claim above needed a caveat**: reproducing it from a
+      clean container hit three *earlier*, unrelated problems first — two infra bugs (two test
+      containers sharing one GPU/vtest server destabilizes the whole Android container, not just
+      Vulkan; the `libdrm.so -> libdrm.so.2` symlink fix from `gralloc.cros.so` needs reapplying to
+      *every* fresh container, and skipping it fails silently as far back as
+      `vkEnumerateInstanceVersion` itself) and one real, older bug — `SurfaceFlinger` picks the GL
+      Skia backend by default here (an aconfig flag gates Vulkan, unset in this build), fixed
+      permanently by adding `setprop debug.renderengine.backend skiavkthreaded` to
+      `gpu_config.sh`. With a clean, single-container boot and all three fixed, hit a new, precise,
+      **not-Mesa** wall: `VulkanInterface::init()` aborts on `VK_KHR_external_semaphore_fd`'s
+      `SYNC_FD` handle type — required unconditionally by SurfaceFlinger's compositor fence sync.
+      Confirmed by direct comparison against the same running `virgl_test_server`: the **host**
+      NVIDIA driver genuinely supports it (real `vulkaninfo` device extension), but Venus never
+      forwards it to the guest (absent from all 108 extensions `list_exts` sees, though the base
+      `VK_KHR_external_semaphore` is present). This sits *upstream* of the EGL_BAD_PARAMETER/AHB
+      chase — RenderEngine has to finish Vulkan init before any AHardwareBuffer import is even
+      attempted — so today's fixes make that investigation reachable through a real boot for the
+      first time, rather than resolving it directly. The Mesa build environment (NDK, meson, this
+      project's own Mesa checkout, instrumented `vn_android.c` with `__android_log_print`
+      diagnostics) is built and ready, waiting on this new blocker. Next session: check whether
+      `waydroid-nvidia`'s actual virglrenderer fork (not just this AOSP tree's generic mirror,
+      whose own `vkr_common.c` already has `KHR_external_semaphore_fd` allowlisted) is the same
+      source the deployed binaries were built from, and why the extension doesn't reach the guest
+      despite that. See DEVLOG for the full trail, bug by bug.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —

@@ -897,3 +897,75 @@ peers on the ANGLE side (also locally buildable, `external/angle`) and/or at the
 located — `vn_android_get_ahb_format_properties` is the *helper*, not the public Vulkan entry
 point that calls it) — bypassing Android's log-level system entirely, since it's demonstrably not
 reliable for this specific investigation.
+
+## 2026-09-23 (same day) — Built the instrumented Mesa driver; found the crash isn't in Mesa at all — it's two infra bugs and one real, deeper Venus gap upstream of it
+
+Set up the standalone Mesa cross-build for real this time. `waydroid-nvidia`'s recipe needed two
+small fixes not mentioned anywhere: meson 1.3.2 calls the fallback option `force_fallback_for`,
+not `allow-fallback-for` (renamed at some point upstream), and this AOSP `external/mesa3d`
+checkout needs `python3-mako` (`meson.build` checks for it explicitly, otherwise fails before
+configuring anything) and a `libdrm` wrap (`meson wrap install libdrm` — not vendored in this
+tree's `subprojects/`). With both fixed, `ninja -C ... src/virtio/vulkan/libvulkan_virtio.so`
+built clean on the first real attempt: 244 targets, no errors. Instrumented
+`vn_android.c`'s `vn_GetAndroidHardwareBufferPropertiesANDROID` (the real entry point ANGLE calls)
+and its helpers with unconditional prints — switched from `fprintf(stderr, ...)` to
+`__android_log_print(ANDROID_LOG_ERROR, "REDROID-DIAG", ...)` partway through, since stderr from a
+library loaded into `surfaceflinger` has no guaranteed path to `logcat`, while `__android_log_print`
+does (confirmed via `strings`/`readelf --dyn-syms`: the tag is embedded, `liblog.so` was already a
+linked dependency, `__android_log_print` resolves `UND` against it).
+
+**Never got to test a single one of those prints — the deploy itself would not boot stably long
+enough to matter**, and chasing that turned into the real work of this session. Three real,
+independently-confirmed problems, in the order they were found:
+
+**1. Two freshly-created test containers sharing one GPU/vtest server crash-loop the whole
+Android container, not just Vulkan.** Created a second test container (`jg-t4-diag2`) alongside
+the already-running, stable `jg-t4-dbg3` to test the new library — it died with exit code 129
+(SIGHUP) every ~15-20s, no matter what was deployed into it, even a byte-for-byte copy of dbg3's
+own known-good, untouched `vulkan.virtio.so`. Root-caused by elimination: stopped `dbg3` and the
+*exact same* fresh-container recipe survived past 5 minutes immediately. Never fully diagnosed
+*why* two guests fighting over one `virgl_test_server --multi-clients` instance destabilizes the
+whole container rather than just failing GPU calls cleanly — logged as a real constraint for all
+future testing on this box (single GPU, single test container at a time) rather than chased
+further, since the instructions returned by the answer already point at the practical fix.
+
+**2. `docker cp`-deployed test containers need `libdrm.so -> libdrm.so.2` reapplied on *every*
+fresh container, and skipping it fails silently at the worst possible layer.** Established
+routine for `gralloc.cros.so` from Tier 4's own earlier sessions; forgot to reapply it to a new
+container built from scratch today. Consequence was not a gralloc error — it was
+`vkEnumerateInstanceVersion` itself, the very first Vulkan loader call, returning
+`VK_ERROR_OUT_OF_HOST_MEMORY` with **zero indication it was a missing-library problem**, because
+`vulkan.virtio.so` (which needs `libdrm.so`, confirmed via `readelf -d`) never got far enough
+through `dlopen()` to report why. Re-running the symlink fix without touching anything else made
+this specific failure disappear completely on the next `surfaceflinger` restart.
+
+**3. Once both of the above were out of the way, `SurfaceFlinger` chose the GL Skia backend
+instead of Vulkan by default — an aconfig flag (`vulkan_renderengine`) gates it, and it isn't
+flipped in this build — which is a separate, older bug from the two above (this is why the
+original `EGL_BAD_PARAMETER` investigation's own "RenderEngine confirmed creating a real Vulkan
+device" note from earlier sessions was evidently against a differently-configured test run, not
+this checked-in `gpu_config.sh`).** Forced it directly with
+`setprop debug.renderengine.backend skiavkthreaded` (checked first, ahead of the aconfig flag, in
+`SurfaceFlinger.cpp`'s `chooseRenderEngineType()`) — added permanently to `gpu_config.sh`'s
+`nvidia-drm` branch. This got `SkiaVK Backend (Ganesh)` selected and logged for the first time all
+session.
+
+**With all three fixed, hit a new, real, precisely-diagnosed wall — not Mesa, not our own code:**
+`RenderEngine`'s `VulkanInterface::init()` now aborts with *"Vulkan device does not support
+sufficient external semaphore sync fd features. exportFromImportedHandleTypes 0x0 (needed 0x10)
+compatibleHandleTypes 0x0 (needed 0x10) externalSemaphoreFeatures 0x0 (needed 0x3)"* — i.e.
+`VK_KHR_external_semaphore_fd`'s `SYNC_FD` handle type, which `SurfaceFlinger` requires
+unconditionally for its Android-native-fence compositor pipeline. Confirmed by direct comparison,
+same running `virgl_test_server`, same GPU: the **host** NVIDIA driver fully supports it
+(`vulkaninfo` on jgustavo48 lists `VK_KHR_external_semaphore_fd` as a real device extension) but
+it **never reaches the guest** — `list_exts` against the live vtest connection shows
+`VK_KHR_external_semaphore` (the base extension) present but `_fd` absent from the 108 extensions
+actually forwarded. Checked this AOSP tree's own `external/virglrenderer/src/venus/vkr_common.c`
+(line 97): its static allowlist already has `.KHR_external_semaphore_fd = true` — so either this
+generic AOSP mirror isn't the same source `waydroid-nvidia`'s prebuilt v0.1.2 binaries were built
+from, or there's a runtime capability check beyond the allowlist that's failing specifically here.
+Not yet resolved — this is the real next-session target, and it sits **upstream of** the whole
+`EGL_BAD_PARAMETER`/AHardwareBuffer chase from earlier tonight (RenderEngine has to finish
+initializing as Vulkan at all before any AHardwareBuffer import would even be attempted), which
+means today's fixes make the AHB investigation *reachable* through a real boot for the first time,
+rather than resolving it directly.
