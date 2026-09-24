@@ -289,18 +289,72 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       `MediaCodec` falls back to a software H.264 encoder, which needs the same CPU-readable RGBA
       source `screencap` does, hitting the identical broken path. Practical takeaway: today,
       *every* way to get pixels out of this guest for viewing or recording is affected, not just
-      screenshots — and conversely, a **real hardware encoder (Tier 7, NVENC)** might sidestep
-      this entire problem for video/streaming specifically, since hardware encoders typically
-      consume a GPU-native tiled surface directly without ever touching it from the CPU. Not
-      attempted yet — a real prioritization option for next time. See DEVLOG's 2026-09-25
-      entries for the full trail.
+      screenshots. **Decision: shelved here, in favor of Tier 7.** Rather than build Tier 5's own
+      two-buffer untiling fix first and put a real encoder on top of it, do the reverse: build
+      Tier 7 (NVENC) first, since a real hardware encoder reads the driver's native tiled surface
+      directly and never touches it from the CPU — for the video/streaming use case specifically,
+      it may make Tier 5's fix unnecessary by construction rather than needing it as a
+      prerequisite. `screencap`/any genuine CPU pixel read still needs Tier 5's fix regardless,
+      but that's no longer the critical path. See DEVLOG's 2026-09-25 entries for the full trail.
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
       `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
       been investigated at all yet in this context.
-- [ ] **Tier 7 — Hardware video encode (NVENC).** The actual encode goal, structurally similar to
-      what redroid-hwenc solved for VA-API — likely a host-side daemon speaking NVENC instead of
-      VA-API, reusing whatever of that project's architecture (Codec2 component shape, protocol
-      design) still applies once the encode-specific parts are swapped.
+- [ ] **Tier 7 — ⭐ Hardware video encode (NVENC). In progress: the make-or-break spike is
+      confirmed on real hardware.** Structurally similar to what redroid-hwenc solved for VA-API
+      (a host-side daemon the Codec2 component talks to), but the exact transport differs: NVENC
+      is driven through CUDA's external-memory interop, not a plain VA-API dma-buf import, and the
+      real question was whether that interop tolerates the *same* dma-buf minigbm's
+      `nvidia_venus.c` backend already hands the guest for `HW_VIDEO_ENCODER`-usage buffers today
+      (untouched by Tier 5 — that backend only sets the `MAPPABLE` alloc flag for `SW_READ`/
+      `SW_WRITE`/`LINEAR` usage, never for `HW_VIDEO_ENCODER` alone, so such a buffer already comes
+      back from `vtest_gpu_alloc_gpu()` as a real, OPTIMAL-tiled, GPU-only allocation — exactly
+      the shape Tier 7 needs, with no minigbm changes required). Standalone spike
+      ([`tests/tier7_nvenc_dualexport_spike.c`](tests/tier7_nvenc_dualexport_spike.c), no
+      Android/redroid/virglrenderer involved) built the same OPTIMAL/DRM-modifier-tiled image
+      `vtest_gpu_alloc_gpu()` allocates, cleared it to a known color via `vkCmdClearColorImage`
+      (GPU-only, no CPU write), and tried to get that exact allocation into NVENC. **First real
+      finding**: CUDA's `cuImportExternalMemory` has no dma_buf-specific handle type at all — only
+      `OPAQUE_FD`/`WIN32`/`D3D12` — and a fd the Vulkan driver exported specifically as
+      `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` is rejected outright when imported as
+      `OPAQUE_FD` (`CUDA_ERROR_UNKNOWN`), so the two handle-type tags are not interchangeable on
+      this driver despite referring to the same kind of Linux fd underneath. **Fix, confirmed
+      working**: request *both* handle-type bits (`DMA_BUF_BIT_EXT | OPAQUE_FD_BIT_KHR`) in the
+      same `VkExternalMemoryImageCreateInfo`/`VkExportMemoryAllocateInfo` at allocation time, then
+      call `vkGetMemoryFdKHR` twice against the one underlying `VkDeviceMemory` — once per handle
+      type. The driver hands back two independent fds referencing the same allocation; the
+      `DMA_BUF` one is exactly what today's guest-side pipeline already consumes unchanged, and
+      the `OPAQUE_FD` one imports into CUDA cleanly
+      (`cuImportExternalMemory`/`cuExternalMemoryGetMappedMipmappedArray`/
+      `cuMipmappedArrayGetLevel` → a real `CUarray`, tagged with the
+      `CUDA_ARRAY3D_VIDEO_ENCODE_DECODE` flag `dynlink_cuda.h` defines for exactly this use).
+      **Two further real bugs found and fixed**, both driver-version mismatches rather than
+      logic errors: (1) the installed `ffnvcodec`/NVENC SDK header (13.1, from FFmpeg's
+      `nv-codec-headers`) is newer than what this driver's `libnvidia-encode` (595.91.07) actually
+      implements (13.0, confirmed via `NvEncodeAPIGetMaxSupportedVersion`) — every `NV_ENC_*_VER`
+      struct-version macro bakes in the header's own major.minor at compile time, so using them
+      as-is fails every call with `NV_ENC_ERR_INVALID_VERSION`; fixed by rebuilding each struct's
+      version tag from the driver's own reported major.minor instead of the header's; (2) NVENC
+      manages pushing/popping its CUDA context internally and rejects one still left current on
+      the calling thread (`NV_ENC_ERR_INVALID_ENCODERDEVICE` from `NvEncInitializeEncoder`, despite
+      `NvEncOpenEncodeSessionEx` on the very same context having already succeeded) — fixed with
+      an explicit `cuCtxPopCurrent` after CUDA-side setup finishes and before any NVENC call,
+      matching NVIDIA's own `NvEncoderCuda` sample. **With all three fixed, the full chain ran
+      end to end on the real RTX 4060**: real Vulkan OPTIMAL/tiled image → dual dma_buf/opaque_fd
+      export → CUDA external-memory import → `CUarray` → `NvEncRegisterResource`
+      (`NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY`) → `NvEncEncodePicture` → 314 bytes of real,
+      decodable H.264 — decoded back with `ffmpeg`, the pixel color survived the whole trip
+      ((220,180,40) in → (214,184,44) out, matching within normal YUV420 round-trip rounding).
+      **Zero CPU reads of pixel data anywhere in this path.** One operational gotcha found along
+      the way: leaving the NVENC session/CUDA context open at process exit hangs the driver's own
+      teardown — fixed by calling `NvEncDestroyEncoder` explicitly before exiting. **What's next**:
+      wire this into the real pipeline — a host-side daemon (or logic added directly inside
+      `virgl_render_server`, which already holds the exact `VkDevice`/`VkImage` handles for
+      whatever buffer Venus routes through it, potentially skipping the dual-export dance entirely
+      for buffers it allocates itself) that a `c2.hardware.encoder.h264` Codec2 component — reused
+      largely as-is from redroid-hwenc's `VaapiEncComponent`, swapping the VA-API calls for this
+      NVENC path — can drive for a real `HW_VIDEO_ENCODER`-usage guest buffer. See DEVLOG's
+      2026-09-25 entries for the full session, including the exact commands and error codes at
+      each step.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution.
 

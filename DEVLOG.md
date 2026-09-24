@@ -1311,3 +1311,130 @@ it from the CPU at all - if so, Tier 7 could deliver a correct-looking video/str
 before Tier 5's own two-buffer fix is built, even though `screencap`/any genuine CPU pixel read
 would still need Tier 5's fix regardless. Not attempted this session - flagged as a real
 prioritization option for whoever picks this back up.
+
+## 2026-09-25 (new session) - Decision: shelve Tier 5, pursue Tier 7 first, and use the encoder to answer Tier 5 in reverse
+
+Picked this project back up specifically to act on the prioritization question the previous
+session ended on. Decision made explicitly before touching any code: don't build Tier 5's own
+two-buffer untiling fix and then put an encoder on top of it - do the trip in reverse. Build
+Tier 7 (NVENC) first, since a real hardware encoder consumes the driver's native tiled surface
+directly and never asks for a CPU pointer at all. If that holds up on real hardware, Tier 7
+answers Tier 5's practical (video/streaming) half by construction, without needing Tier 5's fix
+as a prerequisite - `screencap`/any genuine raw-CPU-pixel read would still need it, but that's no
+longer blocking anything.
+
+First checked whether this is even structurally possible before writing any spike code, by
+rereading `nvidia_venus.c` (the minigbm backend from Tier 4): `nvidia_venus_bo_create()` only sets
+the host's `VCMD_ALLOC_GPU_FLAG_MAPPABLE` flag when `use_flags` includes `SW_READ_OFTEN`/
+`SW_WRITE_OFTEN`/`SW_READ_RARELY`/`SW_WRITE_RARELY`/`LINEAR` - `HW_VIDEO_ENCODER` alone isn't in
+that list. That means a buffer gralloc allocates purely for `GRALLOC_USAGE_HW_VIDEO_ENCODER` (no
+`SW_READ`) already, today, with zero changes needed, comes back from the host's
+`vtest_gpu_alloc_gpu()` as a real, `OPTIMAL`/DRM-modifier-tiled, GPU-only allocation - exactly the
+shape a hardware encoder wants, and exactly the shape Tier 5's whole problem was about buffers
+that *also* need to be `SW_READ`. The guest-allocation side of Tier 7 needs no work at all; the
+real open question was purely on the host/encode side: can that same kind of dma-buf actually get
+into NVENC.
+
+### Environment setup
+
+Confirmed available on `jgustavo48` (the RTX 4060 box): `libcuda1`/`libnvidia-encode1` runtime
+libraries at driver version 595.91.07, `ffmpeg` already built with `h264_nvenc`/`hevc_nvenc`/
+`av1_nvenc` (confirming the driver's encode stack works in principle) - but no NVENC/CUDA *headers*
+installed anywhere, and no `nv-codec-headers`/`ffnvcodec` package in Debian's repos. Installed
+FFmpeg's own `nv-codec-headers` (MIT, `github.com/FFmpeg/nv-codec-headers`, the exact project used
+to build the system's own `ffmpeg`) via `git clone` + `make install PREFIX=/usr/local` - gives
+`nvEncodeAPI.h` (the actual NVENC struct/function surface) and `dynlink_cuda.h` (just enough of the
+CUDA driver API for external-memory interop, matching what `ffmpeg` itself depends on). Also
+installed `libegl-dev`/`libgles2-mesa-dev` in case an EGLImage-based import path turned out to be
+necessary - it wasn't; keeping the note since the packages are now on the box either way.
+
+### The spike: `tests/tier7_nvenc_dualexport_spike.c`
+
+Standalone, no Android/redroid/virglrenderer involved - mirrors `vtest_gpu_alloc_image()`'s own
+Vulkan setup (same device-selection logic, same DRM-modifier enumeration, same
+`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`/`COLOR_ATTACHMENT`/`DEVICE_LOCAL` image, same dedicated
+`vkGetMemoryFdKHR` export) to build exactly the kind of buffer `vtest_gpu_alloc_gpu()` already
+hands the guest today, then cleared it to a known color (220,180,40) via `vkCmdClearColorImage` -
+a real GPU command, no CPU write anywhere - and tried to get that exact allocation into NVENC.
+
+**First real finding, immediate**: CUDA's own `cuImportExternalMemory` (`dynlink_cuda.h`'s
+`CUexternalMemoryHandleType`) has no dma_buf-specific handle type at all - only `OPAQUE_FD`,
+`OPAQUE_WIN32`, `OPAQUE_WIN32_KMT`, `D3D12_HEAP`, `D3D12_RESOURCE`. Tried the obvious thing first:
+import the fd `vkGetMemoryFdKHR` exported with `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` as
+`CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD` anyway (a common claim online that they're the same
+kind of fd underneath on Linux). **Failed immediately and reproducibly**: `CUDA_ERROR_UNKNOWN`
+(999). Confirms the two handle-type *tags* are not interchangeable on this driver, whatever the
+underlying fd mechanism actually is.
+
+**Fix, confirmed working on the first try**: request *both* handle-type bits at allocation time -
+`VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR`
+in both `VkExternalMemoryImageCreateInfo::handleTypes` and `VkExportMemoryAllocateInfo::handleTypes`
+- then call `vkGetMemoryFdKHR` *twice* against the one `VkDeviceMemory`, once per handle type. The
+driver accepted the combined-handle-types image/allocation without complaint and happily produced
+two independent, valid fds referencing the same real GPU allocation. The `DMA_BUF`-tagged one is
+byte-for-byte what today's guest-side pipeline already receives and imports unchanged (no
+minigbm/Mesa/vtest protocol change needed for that half at all); the `OPAQUE_FD`-tagged one is what
+CUDA needs. `cuImportExternalMemory` on that second fd succeeded immediately, followed by
+`cuExternalMemoryGetMappedMipmappedArray`/`cuMipmappedArrayGetLevel` producing a real `CUarray` -
+tagged with `CUDA_ARRAY3D_VIDEO_ENCODE_DECODE` (a flag `dynlink_cuda.h` defines specifically for
+this use, alongside `CUDA_ARRAY3D_SURFACE_LDST`).
+
+**Two further real bugs, both driver/header version mismatches, neither a logic error**:
+
+1. Every NVENC call failed with `NV_ENC_ERR_INVALID_VERSION` (15) despite struct fields looking
+   correct. Root cause: the installed `ffnvcodec` header represents NVENC SDK 13.1, but this
+   driver's actual `libnvidia-encode.so.1` (595.91.07) only implements 13.0 - confirmed directly
+   via `NvEncodeAPIGetMaxSupportedVersion()`, which returns a `(major<<4)|minor` packed value
+   (208 = 0xD0 = 13.0) using a *different* encoding than the `NVENCAPI_VERSION` macro
+   (`major | (minor<<24)`) used inside every `NV_ENC_*_VER` struct-version constant. Every one of
+   those constants bakes in the *header's* major.minor at compile time via
+   `NVENCAPI_STRUCT_VERSION()`, so passing them as-is always claims a newer API than the driver
+   supports. Fixed by querying the driver's real major.minor first and reconstructing each
+   struct's version tag from that instead of the header's compile-time macro (a small `MKVER()`
+   helper). One further subtlety: a handful of structs' official version macros
+   (`NV_ENC_CONFIG_VER`, `NV_ENC_INITIALIZE_PARAMS_VER`, `NV_ENC_PRESET_CONFIG_VER`,
+   `NV_ENC_PIC_PARAMS_VER`, `NV_ENC_LOCK_BITSTREAM_VER`) OR in an extra `(1u<<31)` bit that isn't
+   version-dependent - dropping it (on the theory it was a 13.1-only addition) broke nothing
+   directly but wasn't the actual fix; putting it back alongside the driver-reconstructed version
+   is what the working version below uses. `NV_ENCODE_API_FUNCTION_LIST_VER` and
+   `NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER` needed the same driver-based reconstruction with no
+   extra bit.
+2. With (1) fixed, `NvEncOpenEncodeSessionEx` on the CUDA context succeeded, but
+   `NvEncInitializeEncoder` on that same, just-validated context then failed with
+   `NV_ENC_ERR_INVALID_ENCODERDEVICE` (3) - misleading given the session had *just* opened
+   against the identical device pointer. Real cause: NVENC manages pushing/popping the CUDA
+   context internally and expects to receive a *floating* context, not one left current on the
+   calling thread - exactly what NVIDIA's own `NvEncoderCuda` sample does (`cuCtxPopCurrent`
+   right after `cuCtxCreate`). Fixed by popping the context after all CUDA-side setup
+   (`cuImportExternalMemory` etc., which do need it current) finishes, immediately before any
+   NVENC call.
+
+**With all three fixed, the full chain ran end to end on the real RTX 4060, first clean run**:
+real Vulkan `OPTIMAL`/DRM-modifier-tiled image -> dual dma_buf+opaque_fd export from one
+allocation -> CUDA external-memory import -> `CUarray` -> `NvEncRegisterResource`
+(`NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY`, `NV_ENC_BUFFER_FORMAT_ARGB` matching
+`VK_FORMAT_B8G8R8A8_UNORM`'s byte order) -> `NvEncMapInputResource` -> `NvEncEncodePicture` ->
+314 bytes of real H.264 via `NvEncLockBitstream`. Pulled the file over, decoded it with `ffmpeg`,
+sampled a pixel: `(214, 184, 44)` against the `(220, 180, 40)` cleared in - a small, expected
+delta from H.264's YUV420 round-trip (chroma subsampling + rounding), not a bug. **Zero CPU reads
+of the pixel data anywhere in this path**, confirming the core Tier 7 hypothesis directly.
+
+One operational gotcha along the way, not a correctness bug: leaving the NVENC session and CUDA
+context open at process exit hung the process indefinitely (had to `kill -9` it from another
+session) - the driver's own teardown path apparently blocks waiting on something related to the
+still-open encoder. Fixed by calling `NvEncDestroyEncoder()` explicitly before `return 0` -
+process now exits cleanly (confirmed with `timeout 20`).
+
+### What's next
+
+The guest-allocation side needs nothing (confirmed above). What's left is wiring the confirmed
+host-side encode path into the real pipeline: either a standalone host daemon in
+redroid-hwenc's Tier 5 shape (Unix socket, `SCM_RIGHTS` dma-buf fd, minimal protocol) or - a
+redroid-nvidia-specific simplification worth trying first, since it wasn't available to
+redroid-hwenc's AMD/Intel daemon - logic added directly inside `virgl_render_server` itself, which
+already holds the exact `VkDevice` used to allocate whatever buffer Venus routes through it and
+could skip the dual-export/fd-round-trip dance entirely for its own allocations. Either way, the
+Android-side piece is a `c2.hardware.encoder.h264` Codec2 component that can be adapted quite
+directly from redroid-hwenc's own `VaapiEncComponent.{h,cpp}` (built on `SimpleC2Component`,
+`process()` extracting the input `C2GraphicBlock`'s dma-buf fd) - swapping only the VA-API-specific
+transport for whatever the chosen NVENC-side daemon/protocol turns out to need.
