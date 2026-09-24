@@ -1,0 +1,25 @@
+diff --git a/src/gpu/ganesh/vk/AHardwareBufferVk.cpp b/src/gpu/ganesh/vk/AHardwareBufferVk.cpp
+index 1c0957d..3656cc3 100644
+--- a/src/gpu/ganesh/vk/AHardwareBufferVk.cpp
++++ b/src/gpu/ganesh/vk/AHardwareBufferVk.cpp
+@@ -211,6 +211,20 @@ static GrBackendTexture make_vk_backend_texture(
+ 
+     // TODO: Check the supported tilings vkGetPhysicalDeviceImageFormatProperties2 to see if we have
+     // to use linear. Add better linear support throughout Ganesh.
++    //
++    // NOTE(redroid): tried switching to VK_IMAGE_TILING_LINEAR here for CPU-accessed buffers
++    // (AHARDWAREBUFFER_USAGE_CPU_READ/WRITE != NEVER), reasoning that this project's Venus/vtest
++    // CPU-mappable allocation path (a plain memfd+udmabuf, never wrapped in any real Vulkan image
++    // on the host) is genuinely linear system RAM with no real vendor tiling behind it, and that
++    // OPTIMAL was producing corrupted screencap output (real pixels alternating with untouched
++    // zero memory in exact 16-pixel/64-byte blocks - a block-linear-read-as-row-major signature).
++    // Empirically WORSE on the real NVIDIA/Venus stack this project targets: with LINEAR, the
++    // GPU essentially failed to render into the buffer at all (almost entirely zero bytes, no
++    // legible content whatsoever - see DEVLOG's 2026-09-24 entry) - confirming this driver
++    // genuinely doesn't support linear tiling well for AHB import, exactly as this function's own
++    // longstanding comment already warned. Reverted to upstream's OPTIMAL. The real fix needs an
++    // explicit untiling readback step (the driver's own tile format is opaque to a CPU reader),
++    // not a tiling-mode switch - see DEVLOG for the fuller picture.
+     VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
+ 
+     if (isRenderable && (importAsExternalFormat || // cannot render to external formats

@@ -242,8 +242,28 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       **tiled/block-linear GPU memory layout being read back as if it were plain row-major
       linear** — most likely in whatever Vulkan blit actually populates this
       `vtest_gpu_alloc_cpu`-backed CPU buffer from `RenderEngine`'s real rendered frame, not
-      declaring/honoring the linear tiling everyone downstream assumes. That's the concrete next
-      target. See DEVLOG's 2026-09-24 entries for the full trail, test by test.
+      declaring/honoring the linear tiling everyone downstream assumes.
+      **Found the exact line within the hour**: `RenderEngine` uses Skia directly
+      (`GaneshVkRenderEngine`), not ANGLE (a wrong turn first — ANGLE is for GLES *apps*, unrelated
+      to `SurfaceFlinger` itself). Skia's own `AHardwareBufferVk.cpp::make_vk_backend_texture`
+      hardcodes `VK_IMAGE_TILING_OPTIMAL` unconditionally, with its own `TODO` already admitting
+      it: *"Add better linear support throughout Ganesh."* Confirmed via logging that Mesa's
+      correct explicit-modifier path (`vn_android_get_image_builder`) never even fires for this
+      buffer — matches the byte-level evidence exactly: `OPTIMAL` means the real driver writes
+      using its own proprietary tiled addressing into memory every CPU reader treats as plain
+      linear. **Patched it (and ANGLE's identical pattern) to use `LINEAR` for genuinely
+      CPU-accessed buffers, built a full ANGLE and `surfaceflinger` (Skia is statically linked),
+      tested on real hardware — and it made things measurably *worse***: raw pixel dumps went
+      from "real content in a structured 64-byte grid" to "almost entirely zero, no legible
+      content at all." The real NVIDIA driver genuinely doesn't handle `LINEAR` AHB import
+      correctly here, not just for the `INPUT_ATTACHMENT` case the upstream comments call out.
+      **Reverted both changes cleanly** (confirmed via a fresh boot reproducing the original,
+      better, partially-legible corruption exactly) — an important negative result, not a dead
+      end: it rules out a tiling-mode switch entirely and narrows the real fix to something more
+      structural — an explicit untiling *copy* step (driver-tiled render target →
+      genuinely-linear separate buffer) before any CPU reader touches the memory, not a property
+      of the single AHB-imported image. See DEVLOG's 2026-09-24 entries for the full trail, test
+      by test, including exactly which file/line to pick this back up from.
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
       `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
       been investigated at all yet in this context.

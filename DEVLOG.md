@@ -1142,13 +1142,55 @@ Vulkan operation actually populates this buffer — a `vkCmdCopyImage`-style bli
 in the flat linear order everyone downstream assumes, leaving real content in some 64-byte-wide
 columns/blocks and never touching the memory in between.
 
+**Found the exact source within the hour.** `RenderEngine` uses Skia directly
+(`GaneshVkRenderEngine`) for its own Vulkan backend — that's a completely separate codebase from
+ANGLE (ANGLE is the GLES-over-Vulkan layer used by *apps*, not by `SurfaceFlinger` itself; a wrong
+turn earlier in this same session). Skia's own AHardwareBuffer-to-VkImage import
+(`external/skia/src/gpu/ganesh/vk/AHardwareBufferVk.cpp`,
+`make_vk_backend_texture`) hardcodes `VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;`
+unconditionally — with its own `TODO` comment already admitting it: *"Check the supported
+tilings... to see if we have to use linear. Add better linear support throughout Ganesh."*
+Confirmed empirically this is genuinely the active path (added logging at Mesa's
+`vn_android_get_image_builder` — the *different*, ANB-specific helper that correctly builds a
+real explicit-modifier chain — and confirmed it never fires for this 720x1280 buffer at all,
+only for an unrelated 30x30 one with a real vendor-tiled modifier). This lines up exactly with
+the byte-level evidence: `OPTIMAL` here means the real NVIDIA driver (via Venus) writes into this
+buffer using its own proprietary block-linear addressing, while every CPU reader (`screencap`,
+gralloc's `lock()`) interprets the exact same bytes as plain row-major linear — the 64-byte-grid
+pattern is that addressing mismatch made visible.
+
+**Patched it two ways and tested on real hardware — and the obvious fix made things
+measurably worse.** Added a check in both Skia's `make_vk_backend_texture` and (for
+completeness, since it shares the identical hardcoded pattern with an identical justifying
+comment) ANGLE's `AhbDescUsageToVkImageTiling`: when the `AHardwareBuffer`'s usage indicates real
+CPU access (`AHARDWAREBUFFER_USAGE_CPU_READ`/`WRITE_MASK` != `NEVER`), request
+`VK_IMAGE_TILING_LINEAR` instead — reasoning that a buffer needing genuine CPU byte access simply
+cannot be validly `OPTIMAL`, and this project's `vtest_gpu_alloc_cpu` memfd+udmabuf backing has no
+real tiled allocation to begin with. Built a full standalone ANGLE (Soong module `libEGL_angle`/
+`libGLESv2_angle`, `~15` minutes) to test the ANGLE side (confirmed unused by this path, no visible
+effect either way), then rebuilt `surfaceflinger` itself (Skia is statically linked in via
+`libskia`/`libskia_renderengine`, so the real fix needs a `surfaceflinger` rebuild, not just a
+shared-lib swap) with the `LINEAR` change. **Result: substantially worse** — raw pixel dumps went
+from "real content alternating with structured 64-byte zero blocks" to "almost entirely zero,
+essentially no legible content at all." The real NVIDIA driver, via Venus, evidently does not
+handle `LINEAR` tiling for AHB import correctly at all here — not merely "unsupported for
+`INPUT_ATTACHMENT` usage" as Skia's/ANGLE's own comments specifically call out, but broken for
+this basic case too. **Reverted both changes cleanly**, rebuilt, redeployed, and confirmed a
+fresh boot reproduces exactly the original (better) partially-legible corruption — the revert is
+clean and this is genuinely back to Tier 4's baseline, not a regression.
+
 **Where this leaves Tier 5**: the system boots and runs end-to-end with real GPU acceleration —
 this isn't a hard blocker, `sys.boot_completed=1` and `surfaceflinger` stays up, and the actual
-UI is legible under the corruption. The bug is real, reproducible, and now characterized with
-byte-level precision rather than a vague "something about buffers." Next session's concrete
-target: find where the blit that populates this specific `vtest_gpu_alloc_cpu`-backed destination
-buffer is issued (ANGLE's swapchain present path or `RenderEngine`'s screenshot capture path) and
-check whether it's declaring/assuming the correct (linear, `DRM_FORMAT_MOD_LINEAR`) tiling for
-that specific copy, since a mismatched tiling assumption on either the guest (Venus/ANGLE) or
-host (the real NVIDIA driver, via whatever the host's Vulkan blit call actually requests) side
-would produce exactly a 64-byte-grid pattern like this one.
+UI is legible under the corruption. The root cause is now fully identified and located to a
+specific line in a specific, buildable file — but the "obvious" fix is empirically proven wrong
+on this real hardware/driver combination, which is itself valuable: it rules out a whole category
+of solution. What's actually needed is not a tiling-mode switch but an **explicit untiling
+readback step** — the real driver's own block-linear layout is opaque to any non-driver reader by
+design, so something has to ask the driver itself to produce a genuinely linear copy before the
+CPU (or `screencap`, or anything else) touches the memory. Concretely, that likely means: keep
+`OPTIMAL` for the image the GPU actually renders into, and add a real `vkCmdCopyImage`-to-a-
+separate-genuinely-linear-buffer step (or find and correctly use whatever untiling mechanism
+Venus/the host driver already exposes for exactly this) before handing pixels back to a CPU
+reader — a distinct, separate buffer/copy step, not a property of the single AHB-imported image.
+That's a real, scoped, next-session architectural task now that the wrong path (tiling-mode
+switch) is conclusively ruled out.

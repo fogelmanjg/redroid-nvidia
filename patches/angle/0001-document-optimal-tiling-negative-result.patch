@@ -1,0 +1,20 @@
+diff --git a/src/libANGLE/renderer/vulkan/android/HardwareBufferImageSiblingVkAndroid.cpp b/src/libANGLE/renderer/vulkan/android/HardwareBufferImageSiblingVkAndroid.cpp
+index 12c65c3..eddca47 100644
+--- a/src/libANGLE/renderer/vulkan/android/HardwareBufferImageSiblingVkAndroid.cpp
++++ b/src/libANGLE/renderer/vulkan/android/HardwareBufferImageSiblingVkAndroid.cpp
+@@ -70,6 +70,15 @@ VkImageTiling AhbDescUsageToVkImageTiling(const AHardwareBuffer_Desc &ahbDescrip
+     // the pNext chain, with a handleType equal to any one of the handle types
+     // specified in VkExternalMemoryImageCreateInfo::handleTypes ```
+ 
++    // NOTE(redroid): tried making this conditional on CPU usage (returning LINEAR for
++    // AHARDWAREBUFFER_USAGE_CPU_READ/WRITE != NEVER) while chasing screencap corruption on this
++    // project's NVIDIA/Venus stack. Reverted - the equivalent change in Skia's own
++    // AHardwareBufferVk.cpp (the actual path SurfaceFlinger's RenderEngine uses; this ANGLE class
++    // is for GLES apps and isn't exercised by that investigation at all) made real corruption
++    // measurably worse on real hardware: LINEAR tiling is confirmed broken for AHB import on this
++    // driver, not just "unsupported for INPUT_ATTACHMENT" as the comment above already said - see
++    // DEVLOG's 2026-09-24 entry. Left unchanged here since the same driver limitation would very
++    // likely apply to this path too.
+     return VK_IMAGE_TILING_OPTIMAL;
+ }
+ 
