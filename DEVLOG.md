@@ -1598,3 +1598,77 @@ question this session didn't need to answer yet: how the component learns a give
 `nvidia_venus_bo_create()` already imports via `DRM_IOCTL_PRIME_FD_TO_HANDLE` - a real but
 well-scoped next question, not an open unknown the way the encode path itself was before this
 session).
+
+## 2026-09-25 (same session, continued) - The guest side: a real Codec2 component, written and confirmed building against this project's actual AOSP tree
+
+Picked up the exact open question the last entry ended on. Found the full local AOSP checkout
+this project's own Tier 4 work already used (`~/aosp-redroid-15` on `server01`, with a persistent
+build container, `redroid-build-persist`, already running) - and, inside it, something better than
+expected: `external/vaapi_codec2/`, a full copy of redroid-hwenc's own
+`tier5-vaapi-daemon/codec2-component/` tree, already present in this exact checkout (both
+hardware-encoder projects were developed against the same AOSP tree). Real, working
+`service.cpp`/`Android.bp`/`.rc`/manifest/seccomp-policy structure to adapt directly, not just a
+description to reimplement from scratch.
+
+**Checked one architectural assumption before writing any component code**: does
+`VCMD_ENCODE_RESOURCE`'s resource lookup need to happen on the *same* vtest connection that
+created the resource, or can a completely separate connection (the future Codec2 component's own)
+reference a resource id some other connection (minigbm's `nvidia_venus.c`, or the guest's real
+Venus/Mesa driver) registered? Read `virgl_renderer_resource_export_blob()`'s actual source
+(`src/virglrenderer.c`) rather than assuming: it resolves through `virgl_resource_lookup(res_id)` -
+no `ctx_id` parameter anywhere in the call. Confirms virglrenderer's resource table is genuinely
+global across the whole server process, not scoped per client connection the way
+`vtest_resource_import_blob()`'s own per-context bookkeeping (`ctx->resource_table`) might
+suggest. This is what makes the whole design valid: the component can open its own, brand-new
+vtest connection, entirely independent of whatever connection actually created the resource.
+
+**New module**: `external/nvenc_codec2/` (vendored into this repo as
+[`patches/codec2/`](patches/codec2/README.md)) -
+
+- `component/vtest_encode_client.{h,cpp}`: two free functions.
+  `vtest_encode_resolve_res_id()` does `DRM_IOCTL_PRIME_FD_TO_HANDLE` (a *separate* open() of the
+  same render node `nvidia_venus.c` uses - confirmed fine, since `DRM_IOCTL_VIRTGPU_RESOURCE_INFO`
+  reports a property of the resource itself, not of the caller's local handle table) followed by
+  `DRM_IOCTL_VIRTGPU_RESOURCE_INFO` to get the real Venus resource id - a standard virtio-gpu
+  ioctl, no Venus/minigbm changes needed for this half either.
+  `vtest_encode_resource()` opens a fresh vtest connection (same `mesa.vtest.socket.name`
+  property/`VCMD_CREATE_RENDERER` handshake `nvidia_venus.c` itself uses) and issues
+  `VCMD_ENCODE_RESOURCE`.
+- `component/NvencEncComponent.{h,cpp}`: the real `C2Component`, adapted from `VaapiEncComponent`.
+  One real simplification confirmed along the way, not just assumed: `VaapiEncComponent`'s own
+  comments describe genuine detective work to figure out a Surface-sourced frame's native_handle_t
+  layout (it wasn't a `cros_gralloc_handle_t` at all on that AMD/Intel build - empirically dumped
+  integer offsets matched against known buffer dimensions). This project's own gralloc HAL is
+  confirmed `cros_gralloc` (Tier 4's own bringup), which has a real, public, documented
+  `cros_gralloc_handle_t` (`external/minigbm/cros_gralloc/cros_gralloc_handle.h`) - `process()`
+  reads `fds[0]`/`width`/`height`/`strides[0]`/`format`/`format_modifier` straight off it, with the
+  same `numFds`/`numInts`/`magic` validation `cros_gralloc_convert_handle()` itself does, no
+  reverse-engineering needed for this part. Reused the real header directly (added this project's
+  own path to `libminigbm_gralloc_headers`'s Soong `visibility` list - a one-line, behavior-free
+  build-system opt-in) rather than duplicating the struct and risking drift.
+- `service/`: `service.cpp`/`Android.bp`/`.rc`/manifest/seccomp-policy, copied and renamed from
+  `external/vaapi_codec2/service/` - same `IComponentStore/default` registration, same
+  `createComponent()`/`createInterface()` shape, same seccomp policy set (unmodified so far).
+
+**Built successfully with Soong inside `redroid-build-persist`**: `m
+libnvenc_codec2_component` compiled clean first try, both 64 and 32-bit, no warnings. `m
+android.hardware.media.c2-nvenc-service` (the full service binary) hit one real, expected bug on
+the first attempt: `ld.lld: error: undefined symbol: drmIoctl` - `libdrm`, declared on the
+component's own `cc_library_static` `shared_libs`, doesn't propagate to the final `cc_binary` that
+links it. Recognized this immediately as the *exact same* gotcha `VaapiEncComponent`'s own service
+`Android.bp` already has a comment about, for `libcodec2_soft_common`/`libstagefright_foundation` -
+fixed the same way, by re-listing `libdrm` explicitly in the service's own `shared_libs`. Second
+build: clean, full binary produced at
+`out/target/product/redroid_x86_64/vendor/bin/hw/android.hardware.media.c2-nvenc-service`.
+
+**What's confirmed vs. not**: everything here is confirmed at the build level (compiles and links
+against this project's real, exact AOSP tree) and via source-level reasoning (the global
+resource-id scope finding, the real gralloc struct). **Not yet tested**: actual deployment into a
+running redroid container - `dumpsys media.c2` recognizing the component (needs the stock AOSP
+default Codec2 service disabled/replaced first, same as redroid-hwenc's own deployment needed,
+since only one `IComponentStore` may register as `"default"` at a time), whether a real
+Surface-sourced encoder input buffer really does arrive as a `cros_gralloc_handle_t` in practice
+(the one assumption not yet exercised against a real frame), and the actual `MediaCodec` → this
+component → `VCMD_ENCODE_RESOURCE` → NVENC round trip end to end. Exactly the same shape as
+redroid-hwenc's own Tier 4 (skeleton builds and registers) vs. Tier 5 (real integration) split -
+a real, separate next checkpoint, not something to rush into the same session as writing the code.

@@ -407,13 +407,38 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       `res_id` → `virgl_renderer_resource_export_blob()` → plain-import → GPU copy → NVENC → 83
       bytes of real, `ffprobe`-valid 256×256 H.264, confirmed on the RTX 4060.
 
-      **What's left**: the guest side. A `c2.hardware.encoder.h264` Codec2 component — reused
-      largely as-is from redroid-hwenc's `VaapiEncComponent` — that, for a real
-      `HW_VIDEO_ENCODER`-usage buffer, gets its Venus `res_id` (via the guest kernel's
-      `DRM_IOCTL_VIRTGPU_RESOURCE_INFO` or equivalent) and issues `VCMD_ENCODE_RESOURCE` over the
-      same vtest connection minigbm's `nvidia_venus.c` already maintains, instead of a VA-API call.
-      See DEVLOG's 2026-09-25 entries for the full session, including the exact commands and error
-      codes at each step.
+      **The guest side — a real `c2.hardware.encoder.h264` Codec2 component, confirmed building
+      and linking against this project's actual AOSP tree.** Written as
+      [`patches/codec2/`](patches/codec2/) (built and confirmed at
+      `~/aosp-redroid-15/external/nvenc_codec2/` — this project's own AOSP checkout, the same one
+      Tier 4's minigbm/gralloc work used), adapted directly from redroid-hwenc's own
+      `VaapiEncComponent` (present in this same tree at `external/vaapi_codec2/`). Two real
+      simplifications over that reference, both confirmed rather than assumed: (1) no daemon or
+      dma-buf forwarding needed at all — the buffer already lives on the host, so the component
+      only resolves its *Venus resource id* via the guest kernel's own
+      `DRM_IOCTL_VIRTGPU_RESOURCE_INFO` (a standard virtio-gpu ioctl) and asks the host to encode
+      that resource directly via `VCMD_ENCODE_RESOURCE`, over a **brand-new vtest connection** of
+      its own; (2) no empirical native_handle_t reverse-engineering needed — this project's actual
+      gralloc HAL (`cros_gralloc`) produces a real, well-defined `cros_gralloc_handle_t` for every
+      buffer, read directly with the same validation `cros_gralloc_convert_handle()` itself does,
+      unlike `VaapiEncComponent`'s own empirically-dumped-integer-offsets situation. That the
+      component can use a *separate* connection from minigbm's own at all rests on a real,
+      checked finding: `virgl_renderer_resource_export_blob()` resolves resources through
+      `virgl_resource_lookup()` — no `ctx_id` involved — confirming virglrenderer's resource table
+      is global across the whole server process, not scoped per connection. **Confirmed building
+      clean** (both the component library and the full service binary, 64 and 32-bit) inside the
+      `redroid-build-persist` container — one real Soong gotcha found and fixed identically to how
+      `VaapiEncComponent`'s own service Android.bp already had to (a `cc_library_static`'s
+      `shared_libs` don't propagate to the binary that links it — `libdrm` needed relisting
+      explicitly, confirmed via a real `undefined symbol: drmIoctl` on the first attempt). **Not
+      yet tested**: actual deployment into a running redroid container and a real on-device encode
+      — see [`patches/codec2/README.md`](patches/codec2/README.md)'s closing section for the exact
+      three open checks (service registration/`dumpsys media.c2`, whether a real Surface-sourced
+      frame really is a `cros_gralloc_handle_t` in practice, and the full `MediaCodec` → this
+      component → NVENC round trip) — the natural next session's checkpoint, the same way
+      redroid-hwenc's own Tier 4 (build/register) and Tier 5 (real integration) were split across
+      sessions rather than done in one sitting. See DEVLOG's 2026-09-25 entries for the full
+      session, including the exact commands and error codes at each step.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution.
 

@@ -1,0 +1,45 @@
+// redroid-nvidia Tier 7: the real C2Component wiring VCMD_ENCODE_RESOURCE
+// (host-side NVENC, confirmed end to end - see redroid-nvidia's README.md/
+// DEVLOG.md) into c2.hardware.encoder.h264's process() callback.
+//
+// Structural reference: redroid-hwenc's own libvaapi_codec2_component
+// (external/vaapi_codec2/component/Android.bp in this same tree).
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_library_static {
+    name: "libnvenc_codec2_component",
+    vendor: true,
+
+    srcs: [
+        "NvencEncComponent.cpp",
+        "vtest_encode_client.cpp",
+    ],
+
+    export_include_dirs: ["."],
+
+    header_libs: [
+        "libminigbm_gralloc_headers",
+    ],
+
+    shared_libs: [
+        "libcodec2_soft_common",
+        "libcodec2",
+        "libcodec2_vndk",
+        "libcutils",
+        "liblog",
+        "libdrm",
+        "libstagefright_foundation",
+        "android.hardware.graphics.common@1.0",
+    ],
+    export_shared_lib_headers: [
+        "libcodec2_soft_common",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wno-unused-parameter",
+    ],
+}

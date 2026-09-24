@@ -1,0 +1,72 @@
+// Codec2 IComponentStore service for redroid-nvidia's NVENC hardware
+// encoder (Tier 7: real encode wired in via VCMD_ENCODE_RESOURCE).
+// Adapted from redroid-hwenc's android.hardware.media.c2-vaapi-service
+// (external/vaapi_codec2/service/Android.bp in this same tree).
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "android.hardware.media.c2-nvenc-service",
+    vendor: true,
+    relative_install_path: "hw",
+
+    init_rc: ["android.hardware.media.c2-nvenc-service.rc"],
+
+    // AIDL-only, same as redroid-hwenc's own service - this build only
+    // wires up Codec2 stores registered via AIDL.
+    defaults: [
+        "libcodec2-aidl-defaults",
+    ],
+
+    srcs: [
+        "service.cpp",
+    ],
+
+    static_libs: [
+        "libnvenc_codec2_component",
+    ],
+
+    shared_libs: [
+        "libavservices_minijail",
+        "libbinder",
+        "libbinder_ndk",
+        // Not propagated transitively from libnvenc_codec2_component's own
+        // shared_libs (Soong doesn't pull these onto this binary's link line
+        // automatically - same gotcha redroid-hwenc's own vaapi service hit,
+        // see external/vaapi_codec2/service/Android.bp) - listed explicitly.
+        "libcodec2_soft_common",
+        "libstagefright_foundation",
+        "libdrm",
+    ],
+    required: ["android.hardware.media.c2-nvenc-seccomp_policy"],
+
+    vintf_fragments: ["manifest_media_c2_nvenc.xml"],
+}
+
+prebuilt_etc {
+    name: "android.hardware.media.c2-nvenc-seccomp_policy",
+    vendor: true,
+    sub_dir: "seccomp_policy",
+
+    arch: {
+        arm: {
+            src: "seccomp_policy/android.hardware.media.c2-default-arm.policy",
+        },
+        arm64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-arm64.policy",
+        },
+        riscv64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-riscv64.policy",
+        },
+        x86: {
+            src: "seccomp_policy/android.hardware.media.c2-default-x86.policy",
+        },
+        x86_64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-x86_64.policy",
+        },
+    },
+
+    required: ["crash_dump.policy"],
+}
