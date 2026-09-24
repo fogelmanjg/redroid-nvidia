@@ -264,6 +264,25 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       genuinely-linear separate buffer) before any CPU reader touches the memory, not a property
       of the single AHB-imported image. See DEVLOG's 2026-09-24 entries for the full trail, test
       by test, including exactly which file/line to pick this back up from.
+      **Set up a `virglrenderer` build environment (real upstream source at the exact commit
+      `waydroid-nvidia`'s own patches target, all four applied cleanly) — the missing piece
+      before now — and used it to test the "obvious" host-side fix**: `vtest_gpu_alloc.c`
+      already contains a complete, working, real-Vulkan linear+host-visible+renderable
+      allocation (`vtest_gpu_alloc_image(linear=true)`), just never wired up to
+      `vtest_gpu_alloc_cpu()` — the actual function used for every CPU-mappable buffer — which
+      instead uses a plain memfd+`/dev/udmabuf` path, under the original author's own comment:
+      *"NVIDIA-linear path suspected of breaking hwcomposer's own SW buffers."* Wired it up and
+      tested on real hardware: **confirmed the author's suspicion directly** — `vkQueueSubmit
+      resulted in CS error` on every connection, tearing down the Vulkan context each time,
+      eventually limping to a flat, completely blank white screen (no corruption, but also zero
+      content — worse than the baseline). Reverted cleanly (checksums confirmed against the
+      pre-experiment originals). This rules out *any* fix that makes the CPU-mappable buffer a
+      real, directly GPU-renderable image — both a bare tiling-mode switch and a fully-correct
+      driver-native linear allocation fail, independently, for different reasons. **Real next
+      step**: keep the render target `OPTIMAL` (confirmed more stable) and add a genuinely
+      separate second buffer with an explicit `vkCmdCopyImage`/`vkCmdBlitImage` untiling step
+      between them — standard practice elsewhere, just not implemented anywhere in this chain
+      yet. See DEVLOG's 2026-09-25 entry for the full trail.
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
       `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
       been investigated at all yet in this context.

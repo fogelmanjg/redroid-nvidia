@@ -1194,3 +1194,89 @@ Venus/the host driver already exposes for exactly this) before handing pixels ba
 reader — a distinct, separate buffer/copy step, not a property of the single AHB-imported image.
 That's a real, scoped, next-session architectural task now that the wrong path (tiling-mode
 switch) is conclusively ruled out.
+
+## 2026-09-25 (same session, continued) — Built a virglrenderer environment, found waydroid-nvidia already had a real fix for this on the shelf, and independently reproduced why its own author backed away from it
+
+Went looking at how the **host** allocates the CPU-mappable buffer in the first place, since the
+guest-side tiling experiments were exhausted. Cloned real upstream virglrenderer
+(`gitlab.freedesktop.org/virgl/virglrenderer`) at the *exact* base commit `waydroid-nvidia`'s own
+patches target (`dc35e4d`, unlike Mesa's drifted AOSP mirror) and applied all four of its
+virglrenderer patches (`0001` sync_fd export, `0002` dma_buf import, `0003` listen backlog,
+`0004` gpu-alloc + global-priority) plus the standalone `vtest_gpu_alloc.c`/`.h` files - **applied
+and built clean on the first try**, producing a real `virgl_test_server`/`libvirglrenderer.so.1`
+from source for the first time in this project (previously only ever used `waydroid-nvidia`'s
+prebuilt release binaries).
+
+Reading `vtest_gpu_alloc.c` in full while there surfaced something important: it already contains
+a **complete, working, real-Vulkan implementation of a linear, host-visible, renderable image**
+(`vtest_gpu_alloc_image()` with `linear=true` - explicit `DRM_FORMAT_MOD_LINEAR` modifier,
+`VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` so the GPU can render into it,
+`HOST_VISIBLE|HOST_CACHED` memory, exported via a real `vkGetMemoryFdKHR`, with `rowPitch`
+read back from the driver's own `vkGetImageSubresourceLayout()` rather than hand-computed). But
+`vtest_gpu_alloc_cpu()` - the function actually used for every `MAPPABLE` (CPU-visible) buffer,
+including screenshot destinations - doesn't call it. It uses a separate, much simpler memfd +
+`/dev/udmabuf` path instead, under a comment from the original author: *"experiment control:
+udmabuf-first (NVIDIA-linear path suspected of breaking hwcomposer's own SW buffers)"*. In other
+words: the "real" fix already exists in this exact codebase, and its own author already suspected
+it was broken and shelved it in favor of the cruder fallback - without (as far as this project
+can tell) ever having confirmed it either way.
+
+**Confirmed it themselves.** Rewired `vtest_gpu_alloc_cpu()` to call the existing
+`vtest_gpu_alloc_image(..., true, ...)` path instead of the memfd/udmabuf one - a small, surgical
+change reusing code that was already there and already built cleanly. Backed up the original host
+binaries, deployed the patched build, restarted everything, rebooted the guest.
+
+**Result: real, reproducible breakage, immediately** - not the subtle 64-byte-grid corruption from
+before, but a hard failure. The host's `virgl_render_server` log filled with
+`vkQueueSubmit resulted in CS error` / `ring_submit_cmd: vn_dispatch_command failed` on every
+single `surfaceflinger` connection attempt, tearing down the Vulkan context each time
+(`destroying context N (surfaceflinger) with a valid instance`) and forcing `surfaceflinger` to
+retry from scratch repeatedly before finally limping to a boot-completed state that rendered as a
+**flat, completely blank white screen** - no corruption pattern at all, but also zero legible
+content, strictly worse than the OPTIMAL-tiling baseline. This is an actual command-stream
+rejection by the real NVIDIA driver when this specific combination (an explicitly-linear,
+host-visible, dedicated-allocation, dma_buf-exported image, later bound as a live Vulkan render
+target by a completely different process/context across the vtest boundary) gets used for real
+rendering, not merely a misinterpretation-after-the-fact like the tiling experiments were.
+**Independently reproduces, for the first time with hard evidence, exactly what the original
+`vtest_gpu_alloc_cpu` author's comment already suspected** - this is a real, confirmed dead end,
+not merely an untested caution.
+
+Reverted cleanly: restored the original backed-up host binaries (`virgl_test_server`,
+`libvirglrenderer.so.1`, `virgl_render_server` at both its normal path and the hardcoded
+`/usr/local/libexec/virgl_render_server` sandbox location), confirmed checksums match the
+pre-experiment originals exactly, restarted, rebooted the guest, and confirmed a screenshot
+reproduces the exact known-good (partially-legible-under-corruption) baseline again.
+
+**What this rules out, concretely**: any fix that makes the CPU-mappable buffer a *real, directly
+GPU-renderable* Vulkan image - whether via a bare tiling-mode change (yesterday's ANGLE/Skia
+experiment) or via a fully-correct, driver-native linear allocation with an explicit modifier and
+GPU usage flags (today's host-side experiment, using code the project itself already had written
+and built). Both independently fail, for different reasons (misread corruption vs. outright
+command-stream rejection), suggesting the *combination* of "renderable" and "CPU-visible" for a
+single buffer crossing the vtest/venus boundary is fundamentally unreliable on this stack, not
+just a matter of getting one flag or one struct field right.
+
+**What's actually left to try, in order of how invasive it is**:
+1. Keep the screenshot/`AHB`-imported image `OPTIMAL` (as upstream does, and as this project now
+   confirms is the *more* stable of the two options), and add a genuinely separate second buffer
+   plus an explicit `vkCmdCopyImage`/`vkCmdBlitImage` step - GPU renders into the `OPTIMAL` image
+   as it already does today, then a *driver-native* copy (which correctly understands both
+   layouts, since it's the same driver on both sides) transfers the result into a truly separate,
+   never-rendered-into, always-linear destination buffer that only the CPU ever touches. This is
+   real, standard practice on other platforms and doesn't require the single buffer to serve both
+   roles at once - the actual gap here is that neither this project's own `nvidia_venus.c`
+   backend nor Skia's AHB import code currently perform this second copy at all.
+2. Investigate whether `virgl_render_server`'s `vkQueueSubmit` failure has a specific, fixable
+   cause (a missing barrier, wrong queue family, wrong sharing mode) rather than being a hard
+   platform limit - the log's `CS error` is generic and hasn't been traced further than confirming
+   it happens and reliably tearing down the whole context.
+3. Look at whether NVIDIA's own proprietary tools/extensions expose a supported way to read back
+   an `OPTIMAL` image's real pixel data (an official untiling path) rather than assuming Vulkan's
+   standard `vkCmdCopyImage` machinery is what's needed.
+
+The `virgl_test_server`/`virgl_render_server`/`libvirglrenderer.so.1` build environment set up
+today (real upstream source at the exact patch base commit, meson-buildable, confirmed working as
+a drop-in replacement for `waydroid-nvidia`'s prebuilt release) is real, reusable infrastructure
+for whichever of the above gets picked up next - this was the missing piece before today (Mesa's
+build environment existed; virglrenderer's didn't).
