@@ -380,14 +380,40 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       independent of whatever handle type Venus itself used to create it, at the cost of one real
       GPU copy per encoded frame.
 
-      **What's next**: wire this into the real pipeline — a host-side daemon (or logic added
-      directly inside `virgl_render_server`, which already links against virglrenderer's resource
-      table and could call `virgl_renderer_resource_export_blob()` directly in-process) driven by
-      a new vtest command (`res_id` in, H.264 bytes out) that a `c2.hardware.encoder.h264` Codec2
-      component — reused largely as-is from redroid-hwenc's `VaapiEncComponent`, swapping the
-      VA-API calls for this import→copy→NVENC path — issues for a real `HW_VIDEO_ENCODER`-usage
-      guest buffer. See DEVLOG's 2026-09-25 entries for the full session, including the exact
-      commands and error codes at each step.
+      **Third spike — the new vtest command itself, confirmed working end to end over the real
+      wire protocol.** Added `VCMD_ENCODE_RESOURCE` directly to virglrenderer's vtest server (no
+      Venus/resource-creation changes — see
+      [`patches/virglrenderer/README.md`](patches/virglrenderer/README.md) for the exact protocol
+      additions and the new [`vtest_gpu_encode.c`](patches/virglrenderer/vtest_gpu_encode.c)
+      module, which wraps the second spike's confirmed shape — plain-import → GPU copy → NVENC —
+      behind a persistent, resolution-aware encoder session reused across calls): request =
+      `{res_id, width, height, format, stride, modifier}` (the caller supplies the layout directly
+      rather than relying on `virgl_renderer_resource_get_info_ext()`, which doesn't know about
+      this project's opaque host3d blob resources — confirmed via a real `EINVAL` when tried the
+      naive way first), reply = H.264 bytes. A standalone client
+      ([`tests/tier7_vcmd_encode_resource_test.c`](tests/tier7_vcmd_encode_resource_test.c), no
+      Android/redroid involved — same "no Android boot needed" spirit as `tests/list_exts.c`)
+      drives the real vtest wire protocol directly: allocate a real GPU-only resource, register it
+      for a real `res_id`, then call the new command. **Two more real bugs found and fixed**: (1)
+      a pre-existing, racy `SIGSEGV` in `vtest_resource_import_blob()`'s own synchronous barrier
+      when a blob import is the *very first* thing asked of a freshly-created Venus context —
+      never triggered by a real client (which always has genuine ring traffic first), only by this
+      minimal test harness; documented but out of scope to fix here. (2) `cuImportExternalMemory`
+      failing with `CUDA_ERROR_INVALID_CONTEXT` on the *second* call to the encode module: the
+      first spike's CUDA context is popped once at startup for NVENC's sake, but a persistent,
+      multi-call encoder needs to flip it back to current for each reconfigure's CUDA-side work,
+      then pop again before the NVENC calls in that same reconfigure — a real ordering bug specific
+      to making the one-shot spike's flow persistent across many frames. With both fixed: real
+      `res_id` → `virgl_renderer_resource_export_blob()` → plain-import → GPU copy → NVENC → 83
+      bytes of real, `ffprobe`-valid 256×256 H.264, confirmed on the RTX 4060.
+
+      **What's left**: the guest side. A `c2.hardware.encoder.h264` Codec2 component — reused
+      largely as-is from redroid-hwenc's `VaapiEncComponent` — that, for a real
+      `HW_VIDEO_ENCODER`-usage buffer, gets its Venus `res_id` (via the guest kernel's
+      `DRM_IOCTL_VIRTGPU_RESOURCE_INFO` or equivalent) and issues `VCMD_ENCODE_RESOURCE` over the
+      same vtest connection minigbm's `nvidia_venus.c` already maintains, instead of a VA-API call.
+      See DEVLOG's 2026-09-25 entries for the full session, including the exact commands and error
+      codes at each step.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution.
 

@@ -1499,3 +1499,102 @@ full shape of the eventual real integration is now fully de-risked end to end: `
 import -> GPU copy into a self-owned dual-export image -> `OPAQUE_FD` export -> CUDA -> NVENC ->
 H.264 bytes out. What remains is plumbing, not open technical risk: the actual vtest command and
 its guest-side Codec2 caller.
+
+## 2026-09-25 (same session, continued) - The actual vtest command: VCMD_ENCODE_RESOURCE, wired and confirmed over the real wire protocol
+
+Picked up exactly where the last entry left off - "what remains is plumbing" - and built that
+plumbing for real: a new custom vtest command, `VCMD_ENCODE_RESOURCE`, added directly to
+virglrenderer's `vtest/` alongside the existing `VCMD_RESOURCE_ALLOC_GPU`/`VCMD_RESOURCE_EXPORT_FD`
+machinery, wrapping spike 3's confirmed shape (plain-import -> GPU copy -> NVENC) in a real,
+persistent server-side module: `vtest_gpu_encode.c`/`.h`, same lazy-`dlopen` philosophy as
+`vtest_gpu_alloc.c` (Vulkan *and* now CUDA/NVENC all optional at runtime, so the server still works
+on non-NVIDIA hosts without this command). See `patches/virglrenderer/README.md` for the exact
+protocol additions (`vtest_protocol.h`/`vtest.h`/`vtest_server.c`/`vtest_renderer.c`) - kept as
+prose there, same as this project's own earlier `VCMD_RESOURCE_ALLOC_GPU` additions, rather than a
+checked-in diff against the already-heavily-patched working tree.
+
+**Design decision made before writing code**: the request carries the resource's width/height/
+format/stride/modifier directly from the caller, rather than this command deriving them via
+`virgl_renderer_resource_get_info_ext()`. Tried the "derive it" version first anyway, to see if it
+would just work - it didn't: a real, immediate `EINVAL` (confirmed via the function's own
+`report_failed_call` logging), because that API only knows format/dimensions for classic
+(`RESOURCE_CREATE`-style) resources, not the opaque host3d blob resources every buffer in this
+project's own pipeline actually is. Switching to caller-supplied layout is also strictly more
+realistic for the eventual real caller: a Codec2 component already has this exact information from
+its own gralloc/`AHardwareBuffer_describe()` metadata, with no need to round-trip through
+virglrenderer's resource tracking for it at all.
+
+### Building a standalone test client - and hitting virglrenderer's *other* generic resource-creation path for the first time
+
+To test the new command without Android, needed *some* real `res_id` to point it at.
+`tests/tier7_vcmd_encode_resource_test.c` speaks the raw vtest wire protocol by hand (same
+`sock_write_all`/`sock_read_all`/`sock_recv_fd`/`sock_send_fd` pattern `nvidia_venus.c` already
+uses guest-side, just from a standalone host program): allocate a real dma_buf via the existing
+`VCMD_RESOURCE_ALLOC_GPU`, then register that *exact* fd as a tracked resource via
+`VCMD_RESOURCE_IMPORT_BLOB` (this project's own earlier addition, not stock upstream) to get a real
+`res_id`, then call `VCMD_ENCODE_RESOURCE`.
+
+**First real bug, found via `gdb`**: `VCMD_RESOURCE_IMPORT_BLOB` reliably `SIGSEGV`'d inside
+`virgl_renderer_context_export_fence()` (called from its own synchronous barrier, added by this
+project's earlier patches to guarantee a just-imported resource is safe to use immediately - see
+that function's own comment about the render-server socket race it's guarding against). Root
+cause, found by inspecting `vtest_lazy_init_context()`: `VCMD_RESOURCE_IMPORT_BLOB`/
+`VCMD_ENCODE_RESOURCE` both have `init_context: true` in the command table, which lazily creates a
+context with **no capset** (`virgl_renderer_context_create()`, not `_with_flags()`) if the client
+never explicitly ran `VCMD_CONTEXT_INIT` first - and a capset-less context's `ctx->export_fence`
+callback apparently isn't safe to call as the very first operation on it. Fixed by adding an
+explicit `VCMD_CONTEXT_INIT` with `capset_id = VIRTGPU_DRM_CAPSET_VENUS` (4, from
+`virtgpu_drm.h`) before the import - real Venus contexts are what every actual client uses anyway.
+
+**That fix turned out incomplete - the same crash still happened intermittently** (roughly 1-in-3
+to 1-in-5 runs, confirmed by looping the test against fresh server instances). Added temporary
+`fprintf`/`fflush` debug tracing directly around the crash site to pin it down further - and the
+tracing itself made the crash mostly go away, confirming a genuine timing-sensitive race in the
+proxy render-server IPC path (`proxy_context_export_fence()`'s round trip to the sandboxed render
+process), not a logic bug reachable through any normal sequence of calls. Concretely: **no real
+client would ever hit this** - redroid's actual guest Mesa Venus driver always creates a real
+`VkInstance`/`VkDevice` (genuine ring-0 traffic) long before it ever imports a dma_buf as a blob
+resource; only this minimal, hand-rolled test client skips straight to the import with zero prior
+Venus activity on the context. Documented in `patches/virglrenderer/README.md` as a known,
+pre-existing, narrow race - out of scope to fix as part of Tier 7 - and worked around for testing
+purposes by just retrying the test a few times when the server happens to lose the race.
+
+### Second real bug: CUDA context current/popped state across a *persistent*, multi-call encoder
+
+With the crash worked around, `VCMD_RESOURCE_IMPORT_BLOB` returned a real `res_id`, and
+`VCMD_ENCODE_RESOURCE` ran - and failed with `-EIO`. Added targeted, temporary debug tracing
+through every Vulkan/CUDA/NVENC call in `vtest_gpu_encode.c` (removed again once the bug was
+found) and isolated it immediately: `cuImportExternalMemory` returning `CUDA_ERROR_INVALID_CONTEXT`
+(201). Root cause: unlike the two standalone spikes (each a one-shot program: create context, do
+everything once, exit), `vtest_gpu_encode.c` is a **persistent** module reused across many calls.
+Its one-time init (`encode_cuda_nvenc_init_locked()`) pops the CUDA context right after creating
+it, exactly like the spikes did, so NVENC's session-open gets the floating context it needs. But
+the *per-resolution* reconfigure step (`encode_reconfigure_locked()`, which runs on every call
+whose width/height differs from the last) makes further real CUDA calls
+(`cuImportExternalMemory`, `cuExternalMemoryGetMappedMipmappedArray`) - and by the time that runs,
+the context is already popped from init, no longer current on this thread. Fixed with an explicit
+`cuCtxSetCurrent(enc.cuctx)` right before those CUDA calls in the reconfigure step, then popping
+again (`cuCtxPopCurrent_v2`) before continuing to the NVENC calls later in the *same* function -
+a real, Tier-7-specific consequence of turning the spikes' single-shot flow into a persistent,
+resolution-aware, multi-frame-capable module; not something either spike's own one-shot structure
+could have surfaced.
+
+**With both fixed, the full chain ran end to end over the real vtest wire protocol, first clean
+run after the fixes**: connect -> `VCMD_CREATE_RENDERER` -> `VCMD_RESOURCE_ALLOC_GPU` (real
+256x256 dma_buf on the RTX 4060) -> `VCMD_CONTEXT_INIT(VENUS)` -> `VCMD_RESOURCE_IMPORT_BLOB` (real
+`res_id=1`) -> `VCMD_ENCODE_RESOURCE` -> 83 bytes of real H.264, confirmed `ffprobe`-valid
+(`codec_name=h264`, `width=256`, `height=256`). All temporary debug tracing removed afterward;
+rebuilt clean with no warnings.
+
+### What's left
+
+Purely the guest side now. A `c2.hardware.encoder.h264` Codec2 component, adapted from
+redroid-hwenc's own `VaapiEncComponent.{h,cpp}` (same `SimpleC2Component` base, same
+`C2GraphicBlock` dma-buf extraction pattern) - swapping its VA-API daemon socket call for
+`VCMD_ENCODE_RESOURCE` over the vtest connection `nvidia_venus.c` already maintains. The one open
+question this session didn't need to answer yet: how the component learns a given
+`HW_VIDEO_ENCODER`-usage buffer's Venus `res_id` from the guest side (likely
+`DRM_IOCTL_VIRTGPU_RESOURCE_INFO` or an equivalent virtio-gpu ioctl against the GEM handle
+`nvidia_venus_bo_create()` already imports via `DRM_IOCTL_PRIME_FD_TO_HANDLE` - a real but
+well-scoped next question, not an open unknown the way the encode path itself was before this
+session).

@@ -1,4 +1,4 @@
-# virglrenderer — Tier 5 (build environment + a confirmed negative result)
+# virglrenderer — Tier 5 (build environment + a confirmed negative result) and Tier 7 (a new vtest command)
 
 Base: real upstream `gitlab.freedesktop.org/virgl/virglrenderer`, commit in [`BASE`](BASE) — the
 *exact* commit `waydroid-nvidia`'s own virglrenderer patches target (unlike Mesa's drifted AOSP
@@ -62,3 +62,92 @@ GPU-renderable Vulkan image on this stack, whether via a guest-side tiling-mode 
 linear allocation. See `DEVLOG.md`'s 2026-09-25 entry for what's actually left to try next
 (a genuinely separate second buffer with an explicit `vkCmdCopyImage`/`vkCmdBlitImage` untiling
 step, rather than one buffer serving both the GPU-render and CPU-read roles).
+
+## Tier 7: `VCMD_ENCODE_RESOURCE` — a new vtest command for host-side NVENC encode
+
+Adds one new custom vtest command, following the exact shape of `VCMD_RESOURCE_ALLOC_GPU`/
+`VCMD_RESOURCE_EXPORT_FD` above: encode an existing resource's current content to H.264 via NVENC,
+entirely host-side, with no changes anywhere in Venus's own resource- or image-creation code (see
+the main `README.md`'s Tier 7 section for why that's possible — the short version: any resource
+`virgl_renderer_resource_export_blob()` can hand a dma_buf fd for, this can encode). Confirmed
+working end to end against real virglrenderer resource tracking and the real RTX 4060, standalone,
+no Android/redroid involved — see [`../../tests/tier7_vcmd_encode_resource_test.c`](../../tests/tier7_vcmd_encode_resource_test.c).
+
+### New files
+
+- [`vtest_gpu_encode.c`](vtest_gpu_encode.c) / [`vtest_gpu_encode.h`](vtest_gpu_encode.h) — the
+  encode module itself, structured like `vtest_gpu_alloc.c` (Vulkan loaded lazily via `dlopen` so
+  the server keeps working without this command on non-NVIDIA hosts, same for CUDA/NVENC here).
+  Add both to `vtest_sources` in `vtest/meson.build`. Needs FFmpeg's `nv-codec-headers` installed
+  to `/usr/local/include` (`git clone https://github.com/FFmpeg/nv-codec-headers && cd $_ && sudo
+  make install`) for `<ffnvcodec/nvEncodeAPI.h>` — same as [`../../tests/tier7_nvenc_dualexport_spike.c`](../../tests/tier7_nvenc_dualexport_spike.c).
+
+### Modifications to existing files (small, prose-documented like `VCMD_RESOURCE_ALLOC_GPU` above rather than checked in as a diff)
+
+`vtest_protocol.h`: a new command ID after `VCMD_SEMAPHORE_IMPORT_SYNC_FD`:
+```c
+#define VCMD_ENCODE_RESOURCE 45
+/* request = {res_id, width, height, drm_format, stride, modifier_lo, modifier_hi} - the
+ * caller supplies the layout directly (its own gralloc/AHardwareBuffer_describe() metadata)
+ * rather than this command deriving it from virgl_renderer_resource_get_info_ext(), which
+ * only knows format/dimensions for classic resources, not the opaque host3d blobs this
+ * project's buffers actually are (confirmed via a real EINVAL when tried the other way).
+ * reply = {status, byte_count} followed by byte_count bytes of Annex-B H.264 if status==0. */
+#define VCMD_ENCODE_RESOURCE_SIZE 7
+#define VCMD_ENCODE_RESOURCE_RES_ID 0
+#define VCMD_ENCODE_RESOURCE_WIDTH 1
+#define VCMD_ENCODE_RESOURCE_HEIGHT 2
+#define VCMD_ENCODE_RESOURCE_FORMAT 3
+#define VCMD_ENCODE_RESOURCE_STRIDE 4
+#define VCMD_ENCODE_RESOURCE_MODIFIER_LO 5
+#define VCMD_ENCODE_RESOURCE_MODIFIER_HI 6
+#define VCMD_ENCODE_RESOURCE_RESP_SIZE 2
+#define VCMD_ENCODE_RESOURCE_RESP_STATUS 0
+#define VCMD_ENCODE_RESOURCE_RESP_BYTES 1
+```
+
+`vtest.h`: `int vtest_encode_resource(uint32_t length_dw);`
+
+`vtest_server.c`: one more line in the `vtest_commands[]` table, right after
+`SEMAPHORE_IMPORT_SYNC_FD` — `HANDLER(ENCODE_RESOURCE, encode_resource, true)`. `init_context:
+true` matters here: it's what makes the framework lazily create a real context before dispatch
+(see the gotcha below).
+
+`vtest_renderer.c`: `#include "vtest_gpu_encode.h"` near the existing `vtest_gpu_alloc.h` include,
+and a new `vtest_encode_resource()` function right after `vtest_resource_export_fd()` — reads the
+request, calls `virgl_renderer_resource_export_blob(res_id, &fd_type, &fd)` (the exact same call
+`VCMD_RESOURCE_EXPORT_FD` already makes, just without handing the fd back to the client), passes
+the fd plus the caller-supplied layout into `vtest_gpu_encode_dmabuf()`, and writes back
+`{status, byte_count}` followed by the bytes.
+
+### Two real bugs found getting the first end-to-end wire-protocol run working
+
+1. **A pre-existing, racy `SIGSEGV`** in `vtest_resource_import_blob()`'s own synchronous barrier
+   (`virgl_renderer_context_export_fence(ctx->ctx_id, 0, 0, &barrier_fd)`, added by this project's
+   own `0004`-era patches — see the comment already there about forcing a round trip so a
+   just-imported resource's `res_id` is safe to use immediately). Crashes intermittently
+   (confirmed via `gdb`, ~1-in-3 to ~1-in-5 runs) when that barrier is the *very first* thing ever
+   asked of a freshly-created Venus proxy context — i.e. only when a client imports a blob before
+   ever submitting any real Venus ring traffic. **Not triggered by any real client**: redroid's
+   guest Mesa Venus driver always creates a real `VkInstance`/`VkDevice` (genuine ring 0 activity)
+   long before it ever imports a dma_buf as a blob resource. Only surfaced here because
+   [`tier7_vcmd_encode_resource_test.c`](../../tests/tier7_vcmd_encode_resource_test.c) is a
+   minimal hand-rolled vtest client that skips straight to `VCMD_RESOURCE_IMPORT_BLOB` with no
+   real Vulkan/Venus traffic first — a test-harness artifact, not a Tier 7 bug, and out of scope to
+   fix here (noted for whoever next touches `vtest_resource_import_blob`).
+2. **`cuImportExternalMemory` failing with `CUDA_ERROR_INVALID_CONTEXT` (201)`, real and Tier
+   7's own**: `vtest_gpu_encode.c`'s one-time init pops the CUDA context right after creating it
+   (`encode_cuda_nvenc_init_locked()`, needed so NVENC gets a floating context — see the main
+   `README.md`'s first spike). But the *per-resolution* reconfigure step
+   (`encode_reconfigure_locked()`) makes further CUDA calls (`cuImportExternalMemory`,
+   `cuExternalMemoryGetMappedMipmappedArray`) *after* that pop, on a context no longer current on
+   this thread. Fixed with `cuCtxSetCurrent(enc.cuctx)` right before those calls, then popping
+   again (`cuCtxPopCurrent_v2`) before the NVENC calls later in the same function — the context
+   needs to flip between "current" (for CUDA) and "floating" (for NVENC) within a single
+   reconfigure, not just once at startup like the original spike's single-shot flow.
+
+With both fixed, `tier7_vcmd_encode_resource_test.c` runs the *entire* real chain over the real
+vtest wire protocol: connect → `VCMD_CREATE_RENDERER` → `VCMD_RESOURCE_ALLOC_GPU` (real dma_buf on
+the RTX 4060) → `VCMD_CONTEXT_INIT` (capset `VIRTGPU_DRM_CAPSET_VENUS` = 4 — plain/no-capset
+contexts hit bug 1 above even more reliably) → `VCMD_RESOURCE_IMPORT_BLOB` (real `res_id`) →
+`VCMD_ENCODE_RESOURCE` → 83 bytes of real, `ffprobe`-valid 256×256 H.264.
