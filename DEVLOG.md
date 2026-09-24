@@ -1438,3 +1438,64 @@ Android-side piece is a `c2.hardware.encoder.h264` Codec2 component that can be 
 directly from redroid-hwenc's own `VaapiEncComponent.{h,cpp}` (built on `SimpleC2Component`,
 `process()` extracting the input `C2GraphicBlock`'s dma-buf fd) - swapping only the VA-API-specific
 transport for whatever the chosen NVENC-side daemon/protocol turns out to need.
+
+## 2026-09-25 (same session, continued) - Spike 2: does this work on a resource Venus itself owns, with zero Venus changes? First attempt fails silently, second confirms it
+
+Kept pulling the thread from "what's next" above, specifically the "no Venus changes needed"
+option, since it's structurally the cleanest. Found the exact building block that makes it
+possible without reading deeper into Venus's own resource-creation code first:
+`virgl_renderer_resource_export_blob(res_id, &fd_type, &fd)` is already a real, public
+virglrenderer API (`src/virglrenderer.h`) that hands back a dma-buf fd for *any* tracked resource
+by ID - including, in principle, whatever real resource Venus creates to back SurfaceFlinger's
+render target. The remaining open question was narrow and cleanly testable on its own: given only
+that fd (not the `VkImage`/`VkDevice` that produced it - deliberately not touching Venus's own
+image-creation code), can the *encode side*, running as fully separate, independent Vulkan state,
+still get real pixel data into NVENC?
+
+**First attempt** (`tests/tier7_nvenc_reexport_spike-FAILED.c`): the most direct generalization of
+spike 1's dual-export trick - import the foreign fd via `VkImportMemoryFdInfoKHR` and, in the same
+`vkAllocateMemory` call, chain a `VkExportMemoryAllocateInfo` requesting `OPAQUE_FD_BIT_KHR`
+re-export, on a totally separate `VkInstance`/`VkDevice` standing in for "the encode side, in a
+different process, with none of the producer's state". **Silent, confirmed failure**: the call
+returns `VK_SUCCESS`, `cuImportExternalMemory` and the rest of the CUDA/NVENC chain all succeed
+with no error, NVENC produces a plausible byte count - but decoding the output and downsampling to
+a single average pixel gives `(1,0,2)`, essentially black, not the producer's real (30,200,90)
+clear color. Added one diagnostic query before concluding anything:
+`vkGetPhysicalDeviceImageFormatProperties2()` with a `VkPhysicalDeviceExternalImageFormatInfo`
+asking about `DMA_BUF_BIT_EXT` for this exact modifier/format/usage combination reports
+`compatibleHandleTypes=0x200` and `exportFromImportedHandleTypes=0x200` - both equal to
+`DMA_BUF_BIT_EXT`'s own bit (`0x200`) and *not* including `OPAQUE_FD_BIT_KHR`'s bit (`0x1`) at
+all. Per the Vulkan spec, chaining an export request for a handle type absent from
+`exportFromImportedHandleTypes` is invalid usage - this driver just doesn't validate it, and
+silently does something wrong instead of returning an error. A real, reproducible dead end, kept
+as a documented negative result rather than deleted, same as `patches/virglrenderer/vtest_gpu_alloc.c-tried-and-reverted`
+from Tier 5.
+
+**Second attempt** (`tests/tier7_nvenc_copy_export_spike.c`): the driver's own query already
+pointed at the fix - `DMA_BUF_BIT_EXT` *is* self-compatible (`0x200` includes itself), so a plain
+import with no export chained should be valid and correct. Confirmed exactly that: import the
+foreign fd on the encode side's own `VkDevice` with only `DMA_BUF_BIT_EXT` declared (no
+`VkExportMemoryAllocateInfo` at all this time), bind it to a new `VkImage` using the resource's
+real modifier via `VkImageDrmFormatModifierExplicitCreateInfoEXT` (not the "list" variant used at
+allocation time - this side already knows the *one* modifier the resource has). Separately,
+allocate a second, genuinely fresh image the encode side owns outright, built with spike 1's
+already-confirmed-working dual-handle-type shape (`DMA_BUF_BIT_EXT | OPAQUE_FD_BIT_KHR` declared
+at this allocation's own creation time - the part that was never in question). Real GPU work
+in between: `vkCmdCopyImage` from the imported image into the fresh one, both kept `OPTIMAL`/tiled
+throughout the whole operation - deliberately never touching Tier 5's broken `LINEAR`/CPU-mappable
+path at any point. Exported *that* copy as `OPAQUE_FD_BIT_KHR` (self-allocated, self-compatible,
+no spec violation this time) and ran it through the identical CUDA/NVENC chain as spike 1.
+**Confirmed correct on the first real run**: decoded output downsamples to `(44,226,94)` against
+the producer's real `(30,200,90)` clear - the same order of YUV-round-trip delta spike 1 already
+showed, not a new error.
+
+**What this settles**: the real Tier 7 daemon can be built entirely around
+`virgl_renderer_resource_export_blob()` against an existing, Venus-owned resource ID, with *zero*
+changes to Venus's own resource- or image-creation code anywhere in virglrenderer - at the cost of
+one extra real GPU-to-GPU copy per encoded frame (cheap relative to the encode itself, and
+standard practice for hardware-encoder pipelines elsewhere). Combined with the first spike, the
+full shape of the eventual real integration is now fully de-risked end to end: `res_id` in
+(from whatever real resource SurfaceFlinger/Venus is already using) -> `export_blob` -> plain
+import -> GPU copy into a self-owned dual-export image -> `OPAQUE_FD` export -> CUDA -> NVENC ->
+H.264 bytes out. What remains is plumbing, not open technical risk: the actual vtest command and
+its guest-side Codec2 caller.

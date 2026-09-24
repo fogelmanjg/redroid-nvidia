@@ -346,15 +346,48 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       ((220,180,40) in → (214,184,44) out, matching within normal YUV420 round-trip rounding).
       **Zero CPU reads of pixel data anywhere in this path.** One operational gotcha found along
       the way: leaving the NVENC session/CUDA context open at process exit hangs the driver's own
-      teardown — fixed by calling `NvEncDestroyEncoder` explicitly before exiting. **What's next**:
-      wire this into the real pipeline — a host-side daemon (or logic added directly inside
-      `virgl_render_server`, which already holds the exact `VkDevice`/`VkImage` handles for
-      whatever buffer Venus routes through it, potentially skipping the dual-export dance entirely
-      for buffers it allocates itself) that a `c2.hardware.encoder.h264` Codec2 component — reused
-      largely as-is from redroid-hwenc's `VaapiEncComponent`, swapping the VA-API calls for this
-      NVENC path — can drive for a real `HW_VIDEO_ENCODER`-usage guest buffer. See DEVLOG's
-      2026-09-25 entries for the full session, including the exact commands and error codes at
-      each step.
+      teardown — fixed by calling `NvEncDestroyEncoder` explicitly before exiting.
+
+      **Second spike — can this work on a resource Venus itself owns, with zero changes to
+      Venus's own resource-creation code?** virglrenderer already exposes
+      `virgl_renderer_resource_export_blob(res_id, &fd_type, &fd)` — a dma_buf fd for *any*
+      tracked resource by ID, including whatever real resource Venus creates for SurfaceFlinger's
+      render target. The open question was whether the *encode side*, receiving only that fd (not
+      the original `VkImage`/`VkDevice` that made it, since Venus's own resource-creation code is
+      out of scope here), could still get it into NVENC.
+      **First attempt, confirmed broken**
+      ([`tests/tier7_nvenc_reexport_spike-FAILED.c`](tests/tier7_nvenc_reexport_spike-FAILED.c),
+      kept as a documented negative result): import the foreign fd and re-export it as
+      `OPAQUE_FD_BIT_KHR` from the same `vkAllocateMemory` call
+      (`VkImportMemoryFdInfoKHR` + `VkExportMemoryAllocateInfo` chained together). This returns
+      `VK_SUCCESS`, `cuImportExternalMemory` succeeds, NVENC produces a plausible-looking bitstream
+      — but the decoded pixel content comes back black, not the real cleared color.
+      `vkGetPhysicalDeviceImageFormatProperties2(handleType=DMA_BUF_BIT_EXT)` on this exact
+      image/modifier reports `compatibleHandleTypes=0x200` (`DMA_BUF` only) — `OPAQUE_FD` (`0x1`)
+      is not in that set, meaning this combination is a genuine Vulkan spec violation (an
+      export's handle type must be compatible with the import it's chained to) that the driver
+      silently accepts instead of rejecting, producing wrong data with no error anywhere in the
+      chain. **Fixed shape, confirmed correct**
+      ([`tests/tier7_nvenc_copy_export_spike.c`](tests/tier7_nvenc_copy_export_spike.c)): plain-
+      import the foreign fd (`DMA_BUF_BIT_EXT` only, no export chained — self-compatible per the
+      same query, and confirmed correct) into the encode side's own `VkDevice`, then a real
+      `vkCmdCopyImage` (both images `OPTIMAL`/tiled throughout — never touches Tier 5's broken
+      `LINEAR`/CPU-mappable path) into a second, freshly *self*-allocated image built with spike
+      1's already-proven dual-export shape, then export and encode that copy. Confirmed correct on
+      real hardware: (30,200,90) in → (44,226,94) out, the same order of YUV round-trip delta as
+      spike 1. **This means the real Tier 7 daemon needs zero changes to Venus/virglrenderer's own
+      resource/image-creation code** — it can `export_blob()` any existing resource by ID,
+      independent of whatever handle type Venus itself used to create it, at the cost of one real
+      GPU copy per encoded frame.
+
+      **What's next**: wire this into the real pipeline — a host-side daemon (or logic added
+      directly inside `virgl_render_server`, which already links against virglrenderer's resource
+      table and could call `virgl_renderer_resource_export_blob()` directly in-process) driven by
+      a new vtest command (`res_id` in, H.264 bytes out) that a `c2.hardware.encoder.h264` Codec2
+      component — reused largely as-is from redroid-hwenc's `VaapiEncComponent`, swapping the
+      VA-API calls for this import→copy→NVENC path — issues for a real `HW_VIDEO_ENCODER`-usage
+      guest buffer. See DEVLOG's 2026-09-25 entries for the full session, including the exact
+      commands and error codes at each step.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution.
 
