@@ -36,3 +36,15 @@ checkout root, after copying `nvidia_venus.c` into place.
 See `DEVLOG.md`'s 2026-09-23 entries for the full story of how each bug was found — each one
 was hiding behind the previous one, only surfacing once the earlier fix let execution reach it
 for the first time.
+
+## 2026-09-24 update: `bo_invalidate`/`bo_flush`
+
+Added `DMA_BUF_IOCTL_SYNC`-based `bo_invalidate`/`bo_flush` callbacks to `nvidia_venus.c` (this
+backend had none at all before, unlike every other minigbm backend). Genuinely correct minigbm
+behavior for a dma-buf-backed CPU-mappable buffer — but added while chasing a real, still-open
+Tier 5 bug (non-deterministic visual corruption in `screencap` output) that this fix did **not**
+resolve: confirmed via logging that the active lock/unlock path
+(`cros_gralloc/mapper_stablec/Mapper.cpp`, IMapper v5) never actually calls these hooks for this
+buffer. See `DEVLOG.md`'s 2026-09-24 entry for the leading hypothesis instead (a likely host-side
+race in `virglrenderer`'s brand-new `VCMD_SYNC_EXPORT_SYNC_FILE` handler, from
+[`patches/mesa/`](../mesa/)/`waydroid-nvidia`'s sync_fd work).

@@ -212,12 +212,38 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       the guest shows Android's real setup wizard, composited through real Vulkan RenderEngine
       through Venus through a real RTX 4060 —
       [`docs/tier4-first-boot-nvidia-venus.png`](docs/tier4-first-boot-nvidia-venus.png). The
-      image has a visible horizontal line-tearing artifact (legible, not a crash) — almost
-      certainly a stride/row-pitch bug in this project's own `nvidia_venus.c` minigbm backend,
-      the one piece of this chain written from scratch. That's Tier 5's opening target. See
-      DEVLOG for the full trail, bug by bug.
-- [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
-      for encode: an actual verified rendered frame, not just "doesn't crash."
+      image has a visible corruption artifact (legible, not a crash) — see Tier 5 below for what
+      it actually turned out to be. See DEVLOG for the full Tier 4 trail, bug by bug.
+- [ ] **Tier 5 — Confirm real 3D acceleration end to end. In progress: system boots and renders,
+      real corruption bug narrowed to byte-level precision, root cause not yet fixed.** Same bar
+      redroid-hwenc held itself to for encode: an actual verified rendered frame, not just
+      "doesn't crash." Started from the visible corruption in Tier 4's screenshot, assumed a
+      stride/row-pitch bug in `nvidia_venus.c` (the one piece of this chain written from scratch).
+      **Ruled that out with one cheap test**: three `screencap`s of the exact same static screen
+      came back with three different corruption patterns and checksums — a real stride bug is
+      deterministic on unchanging content; this isn't. Checked the stride math anyway
+      (`vtest_gpu_alloc_cpu`'s `ALIGN(width*bpp, 256)`, confirmed against real logged values) —
+      it's correct. Added `bo_invalidate`/`bo_flush` (`DMA_BUF_IOCTL_SYNC`) to `nvidia_venus.c` —
+      genuinely-correct minigbm behavior this backend was missing entirely — but confirmed via
+      logging it's **never called** by the active lock path on this Android 15 build (the newer
+      AIDL `IMapper` v5, which calls `cros_gralloc_driver::lock()`/`unlock()` directly), so it
+      didn't touch the actual bug. Traced that real lock path instead: it does wait on a real
+      Android acquire-fence before returning a CPU pointer — but `cros_gralloc_sync_wait()`
+      treats any negative fence value, including `-1`, as "already signaled, don't wait" — the
+      exact convention today's own `vn_queue.c` patch introduced for the new sync_fd path.
+      Tested whether an immediate submit-then-export race against the host's own bookkeeping
+      could cause a premature `-1`: added a diagnostic 2ms delay before the export call — **no
+      change**, weakening that specific theory. **Went straight to the raw bytes instead**:
+      `screencap`'s raw dump mode shows real, correct background pixels
+      (`(66, 133, 244, 255)`, Android's own blue) alternating with **exactly `(0, 0, 0, 0)`** —
+      genuinely never-written, zero-filled memory, not stale or noisy data — in run-lengths that
+      are **always an exact multiple of 16 pixels (64 bytes)**. That precise, fixed-grain
+      quantization rules out both prior theories and points at something much more specific: a
+      **tiled/block-linear GPU memory layout being read back as if it were plain row-major
+      linear** — most likely in whatever Vulkan blit actually populates this
+      `vtest_gpu_alloc_cpu`-backed CPU buffer from `RenderEngine`'s real rendered frame, not
+      declaring/honoring the linear tiling everyone downstream assumes. That's the concrete next
+      target. See DEVLOG's 2026-09-24 entries for the full trail, test by test.
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
       `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
       been investigated at all yet in this context.

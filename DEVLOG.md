@@ -1045,3 +1045,110 @@ project's own buffer plumbing (`nvidia_venus.c`'s minigbm backend is the prime s
 one piece of this whole chain written from scratch rather than ported from a working reference).
 **This is Tier 5's actual next target**: find and fix that stride bug, then confirm a real,
 undistorted rendered frame.
+
+## 2026-09-24 (later the same night) — Tier 5: ruled out the stride theory, ruled out cache coherency, found a much better-supported lead in the brand-new sync_fd path itself
+
+Started from the leading theory above (a stride/row-pitch bug in `nvidia_venus.c`). Killed it
+with one cheap test: took three more `screencap`s back to back of the exact same static "Hi
+there" screen. **All three came back with different corruption patterns and different
+checksums.** A real stride bug is deterministic — same static frame, same wrong math, same wrong
+picture every time. Non-deterministic corruption on unchanging content means a race, not a
+logic bug. Checked the actual stride math anyway while there (`vtest_gpu_alloc_cpu`'s host-side
+`ALIGN(width * bpp, 256)`, confirmed against real logged values like `720x1280 -> stride=3072`)
+— it's correct.
+
+**Next theory: missing CPU/GPU cache coherency on the shared-kernel udmabuf memory.** This
+backend had no `bo_invalidate`/`bo_flush` at all (every other minigbm backend has them). Added
+them using the generic `DMA_BUF_IOCTL_SYNC` ioctl (the right primitive here specifically because
+vtest's target deployment is client and server sharing one kernel — a real dma-buf, not a
+virtualized transport, so the standard Linux mechanism applies directly; a device-specific ioctl
+like i915's `SET_DOMAIN` wouldn't). Rebuilt (`m gralloc.minigbm` in the `redroid-build-t4`
+Soong container — hit one fresh snag: the `libdrm-2.4.134` meson subproject fetched for last
+night's standalone Mesa build had its own `Android.bp`, colliding with `external/libdrm`'s;
+deleted the extracted subproject directory, since Soong only needs `external/libdrm` and the
+meson wrap was purely for the unrelated standalone build), redeployed, retested. **No change** —
+same kind of non-deterministic corruption. Added temporary always-on logging to confirm the
+hooks even fire: **zero calls, ever**, across a full boot and multiple screenshots. Traced why:
+the active lock path on this Android 15 build is the newer AIDL `IMapper` v5
+(`cros_gralloc/mapper_stablec/Mapper.cpp`), whose `lock()`/`unlock()` call
+`cros_gralloc_driver::lock()`/`unlock()` directly — `drv_bo_invalidate`/`drv_bo_flush` are only
+reachable through the *separate*, caller-optional `flushLockedBuffer()`/`rereadLockedBuffer()`
+AIDL methods, which nothing in this path calls. Kept the fix anyway (correct regardless, harmless,
+useful for any caller that does use those methods) but it's confirmed not the active mechanism —
+see `patches/minigbm/README.md`'s update.
+
+**Traced what `cros_gralloc_driver::lock()` actually does instead**: `cros_gralloc_sync_wait(acquire_fence,
+...)` — it does wait on a real Android sync fence before returning a CPU pointer, which is the
+*correct* design (the producer's fence, not a manual cache flush, is what's supposed to gate a
+safe CPU read). Read `cros_gralloc_sync_wait()` itself
+(`cros_gralloc_helpers.cc`): `if (fence < 0) return 0;` — a negative fence value is treated as
+"already signaled, nothing to wait for." **This is exactly the convention today's own
+`vn_queue.c` patch introduced**: `vn_create_sync_file()` now accepts `*out_fd >= -1` as success,
+where `-1` means "the host says this already retired." If the *acquire fence* SurfaceFlinger
+attaches to the buffer it hands off to the next consumer (`screencap`, in this case) comes from
+this exact code path and is `-1` when the GPU work is *not actually done yet*, `screencap` would
+read the buffer with zero wait — a textbook non-deterministic torn-read, matching every symptom
+observed (mostly-correct content, since the GPU is usually fast enough anyway; occasional
+partial corruption, since "usually" isn't "always"; different every capture, since it's a race).
+
+Traced *why* a premature `-1` is plausible without finding a definitive smoking gun yet: guest's
+`vn_create_sync_file()` submits the GPU work and, on the very next line, asks to export a
+sync_file for that same work — two separate messages over the *same synchronous vtest socket*,
+each under its own short-lived `sock_mutex` lock (not one held across both). The host's
+`vtest_sync_export_sync_file()` (virglrenderer, `vtest_renderer.c`) answers by scanning
+`ctx->timelines[ring].submits` for a still-pending entry that references this exact sync object
+at the requested value — if it isn't there, the response is unconditionally "already signaled,"
+with no distinction between "genuinely retired already" and "hasn't been registered as pending
+yet." Whether the host's own submit-handling registers that bookkeeping entry synchronously
+within the same command dispatch (safe) or only later via an async callback (racy) is *not yet
+confirmed* — that's the concrete next step, and it requires reading/instrumenting
+`virglrenderer`'s own `vkr_queue_sync_submit`/`vtest_submit_cmd2` server-side handling, which
+means setting up a build environment for `virglrenderer` itself (this project only has Mesa's
+build environment so far; the host binaries in use are `waydroid-nvidia`'s own prebuilt release,
+already includes the untouched, still-marked-WIP-by-upstream sync_fd code as-is).
+
+**Tested the cheap version of that theory directly**: added a diagnostic-only 2ms `usleep()` in
+guest-side `vtest_sync_export_syncobj()` before asking the host to export the fence, rebuilt,
+redeployed, recaptured. **No change** — same kind of corruption, same non-determinism. 2ms is a
+very long time for a simple UI composite on an RTX 4060; if the bug were "the host hasn't
+finished its own internal bookkeeping list update yet," that gap should have papered over it
+completely. Reverted the delay (kept out of the published patch) — this specific mechanism is
+very likely not it, though not conclusively ruled out for other timing scales.
+
+**Went straight to the actual bytes instead of theorizing further.** `screencap`'s raw dump mode
+(`screencap /path` with no `-p` — a 16-byte header, width/height/format/dataspace, followed by
+tightly-packed RGBA, no padding) gives a clean way to inspect real pixel values without a PNG
+codec in the way. Confirmed the header: `720x1280`, `RGBA_8888` — matches the buffer already
+being traced (`bo_create 720x1280 ... stride=3072`). Read actual pixel bytes along a fixed
+column: real, correct Android/Material background blue — `(66, 133, 244, 255)` — alternating with
+**exactly `(0, 0, 0, 0)`** — not noise, not stale data, literally untouched, zero-filled memory (a
+fresh memfd page that was never written). Measured the run-lengths of zero vs. non-zero pixels
+along a row: **every run is an exact multiple of 16 pixels (64 bytes)** — `96, 32, 48, 16, 64, 32,
+16, 32, 96, 32, 16, 16, 48, 16, 32, 16, 96, 16, ...`. Across the whole 1280-row buffer: 41 rows
+entirely zero, 1 row entirely written, 1238 rows a mix — always quantized to that same 16-pixel
+grain.
+
+**This rules out both prior theories outright and points somewhere much more specific.** Not a
+stride/row-pitch bug (those corrupt whole-row alignment, not a sub-row 64-byte grid — and the
+pattern would be identical every capture, not different each time). Not a simple
+"cache/DMA-visibility hasn't happened yet" race either — that would leave *stale old content*
+where a write hasn't landed, not a hard `(0,0,0,0)`, and it wouldn't naturally quantize to a fixed
+64-byte grid. A 64-byte-aligned, exactly-quantized pattern of "written vs. genuinely never
+written at all" is the signature of a **tiled/block-linear GPU memory layout being read back as
+if it were plain row-major linear** — i.e. something in this chain (most likely wherever
+`vtest_gpu_alloc_cpu`'s "always linear, CPU stride == GPU stride" assumption meets whatever
+Vulkan operation actually populates this buffer — a `vkCmdCopyImage`-style blit from
+`RenderEngine`'s real rendered frame into this CPU-visible destination) isn't actually writing
+in the flat linear order everyone downstream assumes, leaving real content in some 64-byte-wide
+columns/blocks and never touching the memory in between.
+
+**Where this leaves Tier 5**: the system boots and runs end-to-end with real GPU acceleration —
+this isn't a hard blocker, `sys.boot_completed=1` and `surfaceflinger` stays up, and the actual
+UI is legible under the corruption. The bug is real, reproducible, and now characterized with
+byte-level precision rather than a vague "something about buffers." Next session's concrete
+target: find where the blit that populates this specific `vtest_gpu_alloc_cpu`-backed destination
+buffer is issued (ANGLE's swapchain present path or `RenderEngine`'s screenshot capture path) and
+check whether it's declaring/assuming the correct (linear, `DRM_FORMAT_MOD_LINEAR`) tiling for
+that specific copy, since a mismatched tiling assumption on either the guest (Venus/ANGLE) or
+host (the real NVIDIA driver, via whatever the host's Vulkan blit call actually requests) side
+would produce exactly a 64-byte-grid pattern like this one.

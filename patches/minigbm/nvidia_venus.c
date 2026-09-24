@@ -18,6 +18,7 @@
 
 #include <drm.h>
 #include <errno.h>
+#include <linux/dma-buf.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -269,6 +270,65 @@ static void *nvidia_venus_bo_map(struct bo *bo, struct vma *vma, uint32_t map_fl
 	return addr;
 }
 
+/*
+ * The memory backing this bo (a host memfd exported through /dev/udmabuf,
+ * for MAPPABLE allocations - see vtest_gpu_alloc_cpu on the host side) is
+ * real host RAM shared with the guest's Vulkan/Venus GPU work through the
+ * same kernel, not a virtualized transport - so DMA_BUF_IOCTL_SYNC is the
+ * correct, generic synchronization primitive here (unlike a device-specific
+ * ioctl such as i915's SET_DOMAIN, which assumes a local device backing the
+ * buffer). Genuinely correct minigbm behavior for a dma-buf-backed CPU path
+ * regardless of whether any given caller happens to invoke it.
+ *
+ * NOTE(redroid): added while chasing non-deterministic visual corruption in
+ * screencap output (Tier 5) - confirmed via logging that cros_gralloc's
+ * IMapper v5 lock()/unlock() path (mapper_stablec/Mapper.cpp) never actually
+ * calls drv_bo_invalidate()/drv_bo_flush() for this buffer, so this fix
+ * alone did NOT resolve that corruption. Kept because it's correct anyway,
+ * and useful for any caller that does explicitly call
+ * flushLockedBuffer()/rereadLockedBuffer(). The real corruption's leading
+ * hypothesis, per DEVLOG's 2026-09-24 entry, is a host-side race in the
+ * brand-new VCMD_SYNC_EXPORT_SYNC_FILE path: vn_create_sync_file() submits
+ * GPU work and immediately asks to export a sync_file for it over the same
+ * synchronous vtest socket, and the host's vtest_sync_export_sync_file()
+ * reports "already signaled" (skipping any wait) whenever it doesn't find a
+ * matching pending timeline submit - a lookup that could plausibly race the
+ * host's own bookkeeping for that just-submitted work.
+ */
+static int nvidia_venus_bo_sync(struct bo *bo, uint32_t map_flags, uint64_t dma_buf_sync_end)
+{
+	int fd = drv_bo_get_plane_fd(bo, 0);
+	if (fd < 0)
+		return -errno;
+
+	uint64_t flags = dma_buf_sync_end;
+	if (map_flags & BO_MAP_READ)
+		flags |= DMA_BUF_SYNC_READ;
+	if (map_flags & BO_MAP_WRITE)
+		flags |= DMA_BUF_SYNC_WRITE;
+
+	struct dma_buf_sync sync = { .flags = flags };
+	int ret = drmIoctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+	close(fd);
+	if (ret) {
+		VLOGE("DMA_BUF_IOCTL_SYNC flags=0x%llx failed: %s", (unsigned long long)flags,
+		      strerror(errno));
+		return -errno;
+	}
+	VLOGE("DMA_BUF_IOCTL_SYNC flags=0x%llx OK", (unsigned long long)flags);
+	return 0;
+}
+
+static int nvidia_venus_bo_invalidate(struct bo *bo, struct mapping *mapping)
+{
+	return nvidia_venus_bo_sync(bo, mapping->vma->map_flags, DMA_BUF_SYNC_START);
+}
+
+static int nvidia_venus_bo_flush(struct bo *bo, struct mapping *mapping)
+{
+	return nvidia_venus_bo_sync(bo, mapping->vma->map_flags, DMA_BUF_SYNC_END);
+}
+
 static int nvidia_venus_resource_info(struct bo *bo, uint32_t strides[DRV_MAX_PLANES],
 				      uint32_t offsets[DRV_MAX_PLANES], uint64_t *format_modifier)
 {
@@ -288,6 +348,8 @@ const struct backend backend_nvidia_venus = {
 	.bo_release = drv_gem_bo_destroy,
 	.bo_map = nvidia_venus_bo_map,
 	.bo_unmap = drv_bo_munmap,
+	.bo_invalidate = nvidia_venus_bo_invalidate,
+	.bo_flush = nvidia_venus_bo_flush,
 	.resource_info = nvidia_venus_resource_info,
 	.resolve_format_and_use_flags = drv_resolve_format_and_use_flags_helper,
 };
