@@ -282,7 +282,18 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       step**: keep the render target `OPTIMAL` (confirmed more stable) and add a genuinely
       separate second buffer with an explicit `vkCmdCopyImage`/`vkCmdBlitImage` untiling step
       between them — standard practice elsewhere, just not implemented anywhere in this chain
-      yet. See DEVLOG's 2026-09-25 entry for the full trail.
+      yet. **Checked whether this is narrowly a `screencap` problem before committing to that
+      fix**: connected `adb` directly to the container's Docker bridge IP and recorded a few
+      seconds with `scrcpy --no-window --record=...` — **same corruption, clearly present in
+      real video output.** Makes sense without Tier 6/7 yet: no hardware encoder means Android's
+      `MediaCodec` falls back to a software H.264 encoder, which needs the same CPU-readable RGBA
+      source `screencap` does, hitting the identical broken path. Practical takeaway: today,
+      *every* way to get pixels out of this guest for viewing or recording is affected, not just
+      screenshots — and conversely, a **real hardware encoder (Tier 7, NVENC)** might sidestep
+      this entire problem for video/streaming specifically, since hardware encoders typically
+      consume a GPU-native tiled surface directly without ever touching it from the CPU. Not
+      attempted yet — a real prioritization option for next time. See DEVLOG's 2026-09-25
+      entries for the full trail.
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
       `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
       been investigated at all yet in this context.

@@ -1280,3 +1280,34 @@ today (real upstream source at the exact patch base commit, meson-buildable, con
 a drop-in replacement for `waydroid-nvidia`'s prebuilt release) is real, reusable infrastructure
 for whichever of the above gets picked up next - this was the missing piece before today (Mesa's
 build environment existed; virglrenderer's didn't).
+
+## 2026-09-25 (same session) — Checked whether the corruption is screencap-specific by testing scrcpy: it isn't
+
+Before investing days in the two-buffer fix above, checked a much cheaper question first: does
+the corruption actually reach the *practical* use case (watching/recording the screen), or is it
+narrowly a `screencap`/raw-CPU-lock artifact that a real consumer like video mirroring might
+route around entirely (e.g. via a GPU-native encoder path that never touches the buffer from the
+CPU at all)? Connected `adb` directly to the container's Docker bridge IP
+(`adb connect 172.17.0.2:5555` - no port publishing needed, host and container share the bridge
+network) and ran `scrcpy --no-window --no-audio --record=... --time-limit=3` headless (no X
+display on this SSH session), then pulled a frame out of the recording with `ffmpeg -update 1`.
+
+**Same corruption, clearly present in the actual video output** - same style of horizontal noise
+bands, same legible-text-under-noise character as `screencap`'s output. This makes sense on
+reflection rather than being a surprise: this project hasn't done Tier 6/7 (hardware
+decode/encode) yet, so without a real NVENC-backed encoder, Android's `MediaCodec` falls back to
+a *software* H.264 encoder for scrcpy's virtual-display mirroring, and software encoders need a
+CPU-readable RGBA source to convert to YUV - hitting the exact same broken CPU-lock/tiled-misread
+path as `screencap`, not some separate hardware pipeline.
+
+**Practical implication, worth carrying into whatever's picked up next**: this isn't a narrowly-
+scoped "screenshots are ugly" bug - today, *every* available way to get pixels out of this guest
+for viewing or recording goes through the same broken path, because there is currently no
+alternative to a CPU-based encode. That raises (but doesn't resolve) an interesting strategic
+question for next time: a **real hardware encoder (Tier 7, NVENC)** might sidestep this whole
+problem for the video/streaming use case specifically, since hardware video encoders typically
+consume a GPU-native (tiled) surface directly through a dedicated hardware block, never touching
+it from the CPU at all - if so, Tier 7 could deliver a correct-looking video/streaming path well
+before Tier 5's own two-buffer fix is built, even though `screencap`/any genuine CPU pixel read
+would still need Tier 5's fix regardless. Not attempted this session - flagged as a real
+prioritization option for whoever picks this back up.
