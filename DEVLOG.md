@@ -969,3 +969,79 @@ Not yet resolved — this is the real next-session target, and it sits **upstrea
 initializing as Vulkan at all before any AHardwareBuffer import would even be attempted), which
 means today's fixes make the AHB investigation *reachable* through a real boot for the first time,
 rather than resolving it directly.
+
+## 2026-09-24 (same night) — Found waydroid-nvidia's own fix for exactly this, hand-ported it, and it worked: real NVIDIA GPU acceleration booted redroid to the home screen for the first time
+
+Went looking for how `waydroid-nvidia` itself solves the `VK_KHR_external_semaphore_fd` gap,
+since it's the same fundamental problem (Venus over vtest, NVIDIA host, container/LXC use case)
+this project has been chasing independently. Found the real repo
+([`Shiro836/waydroid-nvidia`](https://github.com/Shiro836/waydroid-nvidia) — not the empty
+`waydroid-nvidia/waydroid-nvidia` name) and its `patches/` directory, which turned out to contain
+exactly this project's next two walls, already solved, as real patches against upstream
+virglrenderer and Mesa:
+
+- **`patches/virglrenderer/0001-...sync_file...patch`**: adds a whole new vtest wire command,
+  `VCMD_SYNC_EXPORT_SYNC_FILE`, letting the host resolve a pending venus timeline sync point to
+  its `VkFence` and export a real kernel `sync_file` fd from it (`vkGetFenceFdKHR` +
+  `VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT`) — legal specifically because vtest's target use
+  case is client and server sharing the same kernel (LXC/container), unlike a real VM. **Already
+  present in the host binaries this project has been using** (`waydroid-nvidia`'s `v0.1.2`
+  release, published *after* this patch's date) — confirmed via `strings` on
+  `virgl_test_server`/`libvirglrenderer.so.1` showing `vtest_sync_export_sync_file`/
+  `vkr_queue_export_fence_sync_file`. No host rebuild needed.
+- **`patches/mesa/0001-...sync_fd...patch`**: the matching *guest* side in
+  `vn_renderer_vtest.c` — queries `VCMD_PARAM_HAS_VENUS_SYNC_FD`, and when present, sets
+  `info->has_external_sync = true` and wires up `sync_ops.export_syncobj`. **This is the piece
+  actually missing** — this project's own Mesa build (vanilla AOSP mirror) hardcodes
+  `has_external_sync = false` unconditionally, matching yesterday's finding exactly.
+- **`patches/mesa/0002-...dma_buf...patch`**: a second, related gap — `bo_ops.create_from_dma_buf`
+  is also hardcoded `NULL` in vanilla Mesa's vtest transport. Realized this would matter *before*
+  even applying it, since `vn_get_memory_dma_buf_properties()` — deep in the AHardwareBuffer
+  import path this project has been chasing since Tier 4 began — calls
+  `vn_renderer_bo_create_from_dma_buf()` unconditionally.
+
+Both Mesa patches target upstream desktop Mesa (`gitlab.freedesktop.org/mesa/mesa`, base
+`a8ce4d8f`), not this project's AOSP mirror — the two trees have drifted enough (missing
+intermediate `VCMD_*` command IDs entirely) that `git apply`/`git am` failed outright. Hand-ported
+both onto this tree instead, keeping upstream's exact wire-protocol numbers
+(`VCMD_SYNC_EXPORT_SYNC_FILE = 39`, `VCMD_PARAM_HAS_VENUS_SYNC_FD = 3`,
+`VCMD_RESOURCE_IMPORT_BLOB = 40`) so it stays wire-compatible with the already-deployed,
+already-patched host binaries without needing to touch them. See
+[`patches/mesa/`](patches/mesa/) for the ported patch, the two originals kept for reference, and
+the full explanation.
+
+**Rebuilt, redeployed, and immediately hit a *third* bug** — this time genuinely new, not
+described in either waydroid-nvidia patch: `vn_android_gralloc_shared_present_usage_init_once()`
+aborts with `assertion "_vn_android_gralloc.front_rendering_usage" failed`. Traced it to a
+32-bit-truncation bug in minigbm's own `gralloc0.cc`: `GRALLOC_DRM_GET_USAGE`'s
+`BUFFER_USAGE_FRONT_RENDERING` is `(1ULL << 32)`, but both minigbm's local variable and Mesa's own
+call-site output parameter are plain `uint32_t` — the bit is silently lost on **both** ends of
+this legacy ABI, so the query always "succeeds" while reporting exactly 0. Rather than widen a
+legacy ABI on both sides for a flag this project doesn't need, softened Mesa's assert to accept
+that as a legitimate outcome.
+
+**With all three fixes in place, RenderEngine initialized as real Vulkan for the first time ever
+in this project**: `Vulkan device supports sufficient external semaphore sync fd features` →
+`Success init Vulkan interface in 228.9 ms` → `GaneshVkRenderEngine::create: successfully
+initialized GaneshVkRenderEngine`. Immediately after, the exact `REDROID-DIAG` instrumentation
+dropped into `vn_android.c` the night before — sitting untested since a build-environment
+detour — started firing for real, repeatedly, against real gralloc buffers:
+`vn_GetAndroidHardwareBufferPropertiesANDROID called` → `vn_android_get_ahb_format_properties ->
+0` → `dma_buf_fd = 25` → `vn_get_memory_dma_buf_properties -> 0 (alloc_size=65536
+mem_type_bits=0x3)` → `vn_GetAndroidHardwareBufferPropertiesANDROID SUCCESS`, over and over, for
+different buffer sizes/formats. **This is the exact `EGL_BAD_PARAMETER` wall from Tier 4's
+opening — resolved, not worked around**: it was never a bug in the AHardwareBuffer import
+logic itself, which was correct the whole time; it was blocked from ever running by the two
+missing vtest transport capabilities above.
+
+`sys.boot_completed` reached `1`. `surfaceflinger` stayed up, same PID, no restart loop.
+`screencap` from inside the guest shows Android's real setup wizard ("Hi there" / language
+picker / START button) — composited through real Vulkan RenderEngine, through Venus, through a
+real NVIDIA RTX 4060, for the first time in this project. Saved as
+[`docs/tier4-first-boot-nvidia-venus.png`](docs/tier4-first-boot-nvidia-venus.png). The image has
+a visible horizontal line-tearing/corruption artifact — legible, not a crash, but a real
+correctness bug still open, almost certainly a stride/row-pitch mismatch somewhere in this
+project's own buffer plumbing (`nvidia_venus.c`'s minigbm backend is the prime suspect, being the
+one piece of this whole chain written from scratch rather than ported from a working reference).
+**This is Tier 5's actual next target**: find and fix that stride bug, then confirm a real,
+undistorted rendered frame.

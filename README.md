@@ -143,8 +143,9 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       socket against the real RTX 4060:
       `PASS: 65536 elements computed correctly on 'Virtio-GPU Venus (NVIDIA GeForce RTX 4060)'`.
       See DEVLOG for the full story including the kernel-module swap.
-- [ ] **Tier 4 — ⭐ Real integration into redroid — buffer allocation fully correct, wall now at
-      Vulkan/EGL native-buffer import.** redroid ships *two* gralloc HALs as prebuilts:
+- [x] **Tier 4 — ⭐ Real integration into redroid — booted to the Android home screen with real
+      NVIDIA GPU acceleration through Venus, for the first time in this project.** redroid ships
+      *two* gralloc HALs as prebuilts:
       `gralloc.gbm.so` (Mesa, no NVIDIA support) and `gralloc.cros.so` (minigbm's real backend-
       dispatch system) — `gpu_config.sh` never selected `cros`. Wrote a real minigbm backend
       (`nvidia_venus.c`, driver name `nvidia-drm`) allocating over the vtest wire protocol proven
@@ -186,16 +187,35 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       Confirmed by direct comparison against the same running `virgl_test_server`: the **host**
       NVIDIA driver genuinely supports it (real `vulkaninfo` device extension), but Venus never
       forwards it to the guest (absent from all 108 extensions `list_exts` sees, though the base
-      `VK_KHR_external_semaphore` is present). This sits *upstream* of the EGL_BAD_PARAMETER/AHB
-      chase — RenderEngine has to finish Vulkan init before any AHardwareBuffer import is even
-      attempted — so today's fixes make that investigation reachable through a real boot for the
-      first time, rather than resolving it directly. The Mesa build environment (NDK, meson, this
-      project's own Mesa checkout, instrumented `vn_android.c` with `__android_log_print`
-      diagnostics) is built and ready, waiting on this new blocker. Next session: check whether
-      `waydroid-nvidia`'s actual virglrenderer fork (not just this AOSP tree's generic mirror,
-      whose own `vkr_common.c` already has `KHR_external_semaphore_fd` allowlisted) is the same
-      source the deployed binaries were built from, and why the extension doesn't reach the guest
-      despite that. See DEVLOG for the full trail, bug by bug.
+      `VK_KHR_external_semaphore` is present). **Went looking for how
+      [`waydroid-nvidia`](https://github.com/Shiro836/waydroid-nvidia) itself solves exactly
+      this — same problem, same architecture — and found real, working patches for it.** The
+      host binaries this project already uses (`v0.1.2`) turned out to already carry the
+      server-side half (confirmed via `strings`); only the *guest*-side Mesa patch was missing.
+      Two upstream trees had drifted too far apart for `git apply` to work, so hand-ported the
+      mechanism onto this project's own Mesa checkout instead, keeping upstream's exact
+      wire-protocol numbers so it stays compatible with the already-deployed host binaries — see
+      [`patches/mesa/`](patches/mesa/). That alone exposed a **second** missing transport
+      capability (`bo_ops.create_from_dma_buf` also hardcoded `NULL`) that
+      `vn_get_memory_dma_buf_properties()` — deep in the AHardwareBuffer import path — needs
+      unconditionally; ported waydroid-nvidia's matching fix for that too. Underneath both, hit a
+      **third**, genuinely new bug: a 32-bit truncation of `BUFFER_USAGE_FRONT_RENDERING`
+      (`1ULL << 32`) across minigbm's legacy `gralloc0_perform()` ABI, on both ends, silently
+      losing the bit and firing an over-strict Mesa assert — softened the assert rather than
+      widen a legacy ABI for a flag not needed here. **With all three fixed, `RenderEngine`
+      initialized as real Vulkan for the first time ever in this project**
+      (`GaneshVkRenderEngine::create: successfully initialized`), and the exact
+      `EGL_BAD_PARAMETER`/AHardwareBuffer wall from earlier in this same tier **resolved itself**
+      — it was never a bug in the import logic, which was correct the whole time; it was blocked
+      from ever running by the two missing transport capabilities above. `sys.boot_completed`
+      reached `1`, `surfaceflinger` stayed up with no restart loop, and a `screencap` from inside
+      the guest shows Android's real setup wizard, composited through real Vulkan RenderEngine
+      through Venus through a real RTX 4060 —
+      [`docs/tier4-first-boot-nvidia-venus.png`](docs/tier4-first-boot-nvidia-venus.png). The
+      image has a visible horizontal line-tearing artifact (legible, not a crash) — almost
+      certainly a stride/row-pitch bug in this project's own `nvidia_venus.c` minigbm backend,
+      the one piece of this chain written from scratch. That's Tier 5's opening target. See
+      DEVLOG for the full trail, bug by bug.
 - [ ] **Tier 5 — Confirm real 3D acceleration end to end.** Same bar redroid-hwenc held itself to
       for encode: an actual verified rendered frame, not just "doesn't crash."
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
