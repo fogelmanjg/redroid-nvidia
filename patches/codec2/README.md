@@ -105,3 +105,15 @@ container and confirming, on real hardware —
 3. The actual encode round trip from a real app/`screenrecord` through `MediaCodec` →
    `Codec2Client` → this component → `VCMD_ENCODE_RESOURCE` → NVENC → real, correct video —
    redroid-hwenc's own Tier 5.6-5.8 equivalent, and the point where the whole Tier 7 arc closes.
+
+**Update, 2026-09-25 (live-deployment session, see DEVLOG):** a real redroid container now boots
+end to end on `jgustavo48` with GPU acceleration (`sys.boot_completed=1`, confirmed via
+`dumpsys activity` and a real `scrcpy` connection) — the environment this component needs to be
+deployed *into* now actually exists and is reachable, which wasn't true before. `dumpsys media.c2`
+on that running container confirmed check 1 above is still open (no `nvenc` component registered —
+the service binary has never been copied in), so all three checks remain exactly as open as
+before. What changed is that there's no longer any environment-level blocker to doing so: the next
+session's task is purely "deploy this service into a running container and drive it," not "first
+get a container to boot at all." The corruption bug from the stock software encoder was also
+observed live for the first time in this same session — real but minor (roughly one bad frame here
+and there, self-correcting), which is the honest baseline this component is meant to improve on.

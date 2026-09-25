@@ -440,6 +440,69 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       sessions rather than done in one sitting. See DEVLOG's 2026-09-25 entries for the full
       session, including the exact commands and error codes at each step.
 
+      **Fourth session, same day — real deployment on `jgustavo48`, first-ever full boot with
+      NVIDIA GPU acceleration, and Tier 5's corruption bug confirmed live (and confirmed mild).**
+      Not a code change to this project's own patches — a live-infrastructure debugging session
+      that closes the loop between everything above and an actual, usable device. Three
+      independent classes of bug, all on the deployment/host side, none in Tier 7's own code:
+      (1) a chain of missing host kernel prerequisites specific to `jgustavo48` post-reboot
+      (binder device nodes existing as plain directories instead of real nodes, `loop`/`ext4`
+      modules unloaded, a long list of netfilter modules `netd` needs that goes well beyond the
+      `iptable_filter` pair this project's own earlier findings mentioned); (2) **two separate,
+      previously-undiscovered deployment gaps**: no existing `deploy_t4_*.sh` script on
+      `jgustavo48` ever copied the real Vulkan ICD (`vulkan.virtio.so`) or ANGLE into a fresh
+      container at all, and that ICD's own `libdrm.so` dependency (the unversioned name, not the
+      `.so.2` the image ships) was missing for *both* the 64-bit copy (blocking `RenderEngine`/
+      `surfaceflinger` outright with "Could not find any physical devices") *and*, discovered only
+      after fixing the first, the 32-bit copy (crashing the 32-bit `media.codec`/OMX service with
+      `Abort message: 'gralloc-mapper is missing'` — the actual reason a first successful-looking
+      `scrcpy` connection showed a persistently empty window: the video encoder's producer-side
+      process was dying before ever handing back a frame, not a Tier 5 corruption issue at all);
+      (3) `virgl_test_server` needs `--multi-clients` even for a single container, since
+      `surfaceflinger` opens more than one Venus connection and the second one hangs forever
+      without it — confirmed via `debuggerd -b` on the stuck PID, not guessed. Full checklist
+      written up as a standalone reference for this host, since it's a distinct, longer list than
+      what was known before. With all of it fixed: a genuinely fresh container reached
+      `sys.boot_completed=1` for the first time in this project's history, `adb`/`scrcpy` connected
+      over the container's own Docker-bridge IP with zero port publishing needed, and a **real
+      rendered UI was visible** — Android's home screen, sharp and legible, `OpenGL version: 4.6.0
+      NVIDIA 595.91.07` in scrcpy's own banner.
+
+      **Tier 5's corruption bug, seen live for the first time (through the actual intended
+      use case — screen viewing/streaming, not just `screencap`), turned out to be real but
+      minor**: intermittent, roughly one bad frame out of many, self-correcting on the very next
+      frame, matching the non-deterministic race this project's own Tier 5 investigation had
+      already diagnosed (a premature "already signaled" sync-fence answer racing the GPU's actual
+      completion) rather than a deterministic, systemic corruption. Confirmed via `dumpsys media.c2`
+      that this was the **stock software encoder**, not NVENC — the new Codec2 service still isn't
+      deployed into any running container, so this result is the honest baseline Tier 7 is meant to
+      improve on, not a contaminated measurement. Practically: the device is fully usable today
+      exactly as it stands, corruption included — a real, useful milestone independent of whatever
+      Tier 7's remaining deployment step ends up showing.
+
+      Two smaller fixes landed the same session, both operational rather than architectural: the
+      Android Setup Wizard was permanently disabled at the image level
+      (`ro.setupwizard.mode=DISABLED` in `/system/build.prop`, since the guest filesystem here is
+      just container layers with no dm-verity — directly editable, no `remount` dance needed),
+      committed as a new image tag (`redroid-jg-15:gapps-nosetup` on `jgustavo48`) that also bakes
+      in every deployment fix above so future containers need zero manual post-boot patching; and a
+      real gap surfaced while validating it — two redroid containers cannot share one set of
+      `/dev/binder`/`/dev/hwbinder`/`/dev/vndbinder` nodes (the second Android instance to grab the
+      real binder driver crashes immediately, silently, before logcat even starts), so running more
+      than one container concurrently on `jgustavo48` needs a second `binder_linux` device set —
+      not yet set up, not yet needed, but now a known, understood prerequisite rather than a
+      surprise for next time.
+
+      **What's left, cleanly scoped for the next session**: deploy the actual
+      `android.hardware.media.c2-nvenc-service` binary (already built, see above) into a running
+      container, disable/replace the stock default Codec2 service so `c2.hardware.encoder.h264`
+      registers as `IComponentStore/default`, and get `scrcpy`/`MediaCodec` to actually pick it —
+      closing Tier 7 end to end and, if the theory holds, eliminating this session's observed
+      corruption entirely by construction (NVENC never reads the tiled surface through the CPU at
+      all). See DEVLOG's 2026-09-25 (fourth session) entry for the full blow-by-blow, and
+      [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
+      external to the repo) for the exact host-prerequisite checklist.
+
 Even if it doesn't go further, each tier on its own is a publishable contribution.
 
 ## Why a separate repo

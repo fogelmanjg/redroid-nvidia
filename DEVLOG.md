@@ -1672,3 +1672,126 @@ Surface-sourced encoder input buffer really does arrive as a `cros_gralloc_handl
 component → `VCMD_ENCODE_RESOURCE` → NVENC round trip end to end. Exactly the same shape as
 redroid-hwenc's own Tier 4 (skeleton builds and registers) vs. Tier 5 (real integration) split -
 a real, separate next checkpoint, not something to rush into the same session as writing the code.
+
+## 2026-09-25 (same day, new session) — Real deployment on jgustavo48: first-ever full boot, scrcpy working, Tier 5's corruption confirmed live and confirmed mild
+
+Different kind of session from everything above — no new code in this project's own patches, all
+of it live infrastructure debugging on `jgustavo48` (the user's own machine, RTX 4060, driver
+595.91.07), working from `server01` over SSH. Goal: deploy a real redroid container and actually
+look at it through `scrcpy`, closing the loop between all the spike-level Tier 7 work above and an
+actual usable device — and, unplanned, it ended up also being the first real, live look at Tier
+5's corruption bug through its actual intended use case (viewing/streaming), not just `screencap`.
+
+**Host prerequisites, again — a longer list than last time.** `jgustavo46` already had a documented
+checklist for this (`loop`/`ext4` modules, `iptable_filter`/`ip6table_filter`) from earlier work,
+but `jgustavo48` needed a longer sequence, found the hard way, each fix revealing the next failure:
+
+1. `docker cp` against *any* container (even ones with no relation to today's work) failed with
+   `mkdirat dev/binder: file exists`. Root cause: `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`
+   existed as plain empty **directories**, not device nodes — leftover from some earlier Docker
+   run that bind-mounted a path before the real node existed. Fixed by `rmdir`-ing them, reading
+   the real registered minor numbers from `/proc/misc`, and `mknod`-ing them by hand.
+2. Container exited immediately (`apexd-bootstrap` failing `DM_DEV_CREATE`/`loop-control`
+   errors). `loop` module wasn't loaded at all. `modprobe loop max_loop=64`, then had to bind-mount
+   all 64 `/dev/loop0`-`/dev/loop63` plus `/dev/loop-control` explicitly — `--privileged` alone
+   doesn't expose devices created after the Docker daemon itself started.
+3. Same `apexd` failure class persisting: `ext4` module never loaded either (host is pure btrfs,
+   no other reason for the kernel to have it). `modprobe ext4`.
+4. Boot proceeded further but `netd` logged a long run of `iptables error: ... unable to
+   initialize table` lines, and `system_server`/`ActivityManager` never finished registering AIDL
+   services — looked like an unrelated crash loop until traced back to this. Needed a genuinely
+   long list of netfilter modules, found by fixing one `iptables error` at a time and rerunning:
+   `iptable_filter`, `ip6table_filter`, `iptable_raw`, `iptable_mangle`, `iptable_nat`, their IPv6
+   counterparts, `xt_owner`, `xt_cgroup`, `xt_socket`, `xt_bpf`, `xt_connmark`, `xt_MASQUERADE`,
+   `xt_mark`, `xt_mac`, `xt_NFLOG`, `xt_u32`, `xt_TCPMSS`, `xt_policy`, and `dummy` (for the
+   bandwidth-accounting interface). `xt_idletimer`/`xt_quota2` don't exist in this kernel build at
+   all and appear non-fatal — netd logs the specific rule failure and continues. Confirmed zero
+   `iptables error` lines on the next clean boot.
+
+**With the host finally clean, the actual GPU bug turned out to be two missing files, not a driver
+regression.** `RenderEngine`/`surfaceflinger` failed with `Could not initialize Vulkan RenderEngine!`
+(`vkEnumerateInstanceVersion failed`, or in other attempts `Could not find any physical devices`).
+Spent real effort ruling out a Venus/driver-negotiation problem first — `strace`d `surfaceflinger`
+for any `connect()`/`openat()` toward the venus socket and found **zero** attempts at all, which
+was the actual tell. `logcat` (not `strace`) had the real answer: `vulkan.virtio.so` — the actual
+Vulkan ICD — was never present in `/vendor/lib64/` on any freshly-created container. Checked every
+`deploy_t4_*.sh` script kept in `~/waydroid-nvidia-test/` on `jgustavo48` (including one literally
+named `deploy_t4_egl.sh`): **none of them copy it**, only gralloc/minigbm/dmabufheap. Copied the
+correct, already-built `vulkan.virtio.syncfd.so` (the later build with the sync_fd patch, sitting
+unused in that same directory) to `/vendor/lib64/vulkan.virtio.so`, plus the matching ANGLE
+libraries to the `egl/` subdirectories `gpu_config.sh` expects. That produced a *different* failure
+— `Could not find any physical devices, bailing` — traced via `logcat` grep for
+`MESA|VN_|venus|virtio` straight to `vndksupport`: `dlopen failed: library "libdrm.so" not found:
+needed by ... vulkan.virtio.so in namespace sphal`. The ICD's own `libdrm.so` dependency (the
+*unversioned* name — the image only ships `libdrm.so.2`) was missing. Pulled the correct one from
+this project's own AOSP build output (`~/aosp-redroid-15/out/target/product/redroid_x86_64/
+vendor/lib64/libdrm.so`) and copied it in. **This produced the first real Venus connection activity
+ever seen on this host** — `gl_version 46 - core profile enabled` in the vtest server's own log,
+for the first time.
+
+**One more hang after that, found via a native backtrace rather than more log-reading.**
+Boot got further but stalled indefinitely with `RenderEngine` claiming success
+(`Success init Vulkan interface`) yet nothing ever completing. `docker exec <container> debuggerd
+-b <surfaceflinger-pid>` showed the main thread blocked in `RenderEngineThreaded::
+waitUntilInitialized()`, while a *second* thread was blocked in `read()` inside
+`vn_renderer_create_vtest` in `vulkan.virtio.so` — `surfaceflinger` opens more than one Venus
+connection, and the vtest server wasn't handling the second one. Root cause: it had been launched
+without `--multi-clients`. Restarted with the full flag set
+(`--no-fork --multi-clients --venus --use-egl-surfaceless --rendernode /dev/dri/renderD128
+--socket-path ...`) and got, for the first time in this project's history, `sys.boot_completed=1`
+on a genuinely fresh container (`jg-fresh2`), confirmed via `dumpsys activity` showing the setup
+wizard resumed/focused with zero fatal crashes.
+
+**`adb connect 172.17.0.2:5555` worked immediately** (the container's own Docker-bridge IP, no
+port publishing needed), and the first `scrcpy` attempt connected but showed a **persistently empty
+window**, failing repeatedly with `IllegalStateException: Pending dequeue output buffer request
+cancelled` even after scrcpy's own automatic retries at lower resolutions. Assumed at first this
+might be Tier 5's already-documented corruption bug surfacing as an outright failure instead of
+visual corruption — checked `logcat` instead of guessing further, and the real story was upstream
+of that exception entirely: a native tombstone in the **32-bit** `media.codec` process
+(`hw/android.hardware.media.omx@1.0-service`, ABI `x86`) aborting with `Abort message:
+'gralloc-mapper is missing'`, repeating every scrcpy retry. Same class of bug as the Vulkan ICD
+fix above, just the 32-bit twin nobody had deployed: `/vendor/lib64/libdrm.so` (64-bit) had been
+fixed, but `/vendor/lib/libdrm.so` (32-bit, unversioned) was still missing — the 32-bit
+`gralloc.cros.so` needs it too, and the 32-bit OMX media server is what actually backs the video
+encoder's producer side. Copied the 32-bit `libdrm.so` from the same AOSP build output
+(`.../vendor/lib/libdrm.so`) to `/vendor/lib/libdrm.so`, cleared logcat, and had the user retry.
+
+**Real image, this time.** `scrcpy` connected, rendered a real, legible Android home screen
+(`OpenGL version: 4.6.0 NVIDIA 595.91.07` in scrcpy's own banner, 720×1280 texture) — Google search
+bar, Gallery/Play Store/Contacts icons, all sharp. The user reported the *very first* screen
+(setup-wizard-adjacent, more animated) flickered with black blocks occasionally, but subsequent
+screens mostly didn't — asked directly whether this was NVENC. Checked rather than assumed:
+`dumpsys media.c2` showed no `nvenc` component registered at all (expected — the service binary
+has never been copied into any running container), confirming this was the **stock software
+encoder**, and that the corruption is exactly Tier 5's already-diagnosed race
+(`screencap`'s own non-deterministic, different-every-capture pattern from that investigation),
+now seen for the first time through the actual intended use case. Practical severity, confirmed
+directly by the user rather than assumed from the DEVLOG's own theoretical severity language:
+"solo levemente molesta... totalmente usable" — roughly one bad frame here and there,
+self-correcting on the next one, not the systemic problem the original diagnosis session's tone
+might have suggested to a future reader.
+
+**Two closing, operational fixes.** (1) Disabled the Setup Wizard permanently at the image level —
+`jg-fresh2`'s `/system` is just container-layer files with no dm-verity, so `echo
+"ro.setupwizard.mode=DISABLED" >> /system/build.prop` directly, no `adb remount` dance needed.
+Committed the container (which by this point also had every deployment fix above baked into its
+layers) as a new image, `redroid-jg-15:gapps-nosetup`, alongside the original `gapps-official` tag
+(not overwritten, kept as a fallback). (2) Tried to validate the fix against genuinely fresh
+`/data` by launching a second container from the new image while `jg-fresh2` was still running —
+it exited immediately (code 129, no logs at all, crashed before logcat even started). Root cause:
+both containers were bind-mounting the *same* real `/dev/binder`/`/dev/hwbinder`/`/dev/vndbinder`
+nodes — binder is real shared kernel state here (this is containerization, not virtualization), so
+two Android instances fighting over one binder driver's context-manager slot is fatal to the
+second one. Not fixed this session (deferred — needs a second `binder_linux` device set for real
+concurrent-container support, a genuine but separate infrastructure task), but now a known,
+diagnosed prerequisite rather than a mystery for next time.
+
+**Where this leaves the project.** Tier 7's actual guest-side component
+(`android.hardware.media.c2-nvenc-service`, built and confirmed compiling in the previous session)
+has still never been deployed into a running container or exercised against a real frame — that
+remains the single, cleanly-scoped next step, and this session's corruption result is the honest,
+uncontaminated *before* picture it needs to improve on. Full host-prerequisite checklist for
+`jgustavo48` (all four kernel-module fixes above, in the order they actually bite, plus the exact
+`libdrm.so`/`vulkan.virtio.so` deployment gap) written up as a standalone reference doc, kept
+outside this repo since it's host-specific operational knowledge rather than project code.
