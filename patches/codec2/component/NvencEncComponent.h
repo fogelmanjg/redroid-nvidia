@@ -70,6 +70,18 @@ private:
 
     std::shared_ptr<NvencEncInterface> mIntf;
     int mRenderNodeFd = -1;
+    // Same reasoning/shape as the reference C2SoftAvcEnc: the framework
+    // (scrcpy included) expects the very first output work to carry a
+    // separate C2StreamInitDataInfo (CSD) with the SPS/PPS, not just an
+    // Annex-B buffer that happens to have them inline - confirmed the hard
+    // way (a real, correctly decodable NVENC bitstream, SPS+PPS+IDR all
+    // present, still rejected by scrcpy with "the first video packet is not
+    // a config packet" until this was added). NVENC's own repeatSPSPPS
+    // setting (vtest_gpu_encode.c) still stays on: it's what makes the
+    // SPS/PPS bytes present in this component's very first response to
+    // split out at all, this flag only tracks that the split has happened
+    // once.
+    bool mCsdSent = false;
 };
 
 }  // namespace android

@@ -60,6 +60,34 @@ int vtest_encode_resource(uint32_t res_id, uint32_t width, uint32_t height,
                           uint32_t drm_format, uint32_t stride, uint64_t modifier,
                           uint8_t **out_buf, uint32_t *out_len);
 
+/*
+ * Encodes a plain dma-buf that is NOT a Venus resource - confirmed on real
+ * hardware 2026-09-26 (see DEVLOG) that a genuine Surface-sourced capture
+ * buffer (GraphicBufferSource, the path any screen-recording app uses) is
+ * exactly this: a real, importable dma-buf that was simply never allocated
+ * through this project's own Venus path, so vtest_encode_resolve_res_id()
+ * above cannot find a resource id for it (there is nothing wrong to fix
+ * there - the resource genuinely was never registered as one). Sends the fd
+ * directly over a plain AF_UNIX socket with SCM_RIGHTS instead - valid here
+ * specifically because redroid shares one real kernel between guest and
+ * host (containerization, not virtualization), the same mechanism
+ * redroid-hwenc's own VA-API daemon already uses. See
+ * ../../virglrenderer/nvenc_scm_protocol.h for the host side.
+ *
+ * dmabuf_fd: borrowed, same as vtest_encode_resolve_res_id()'s own dmabuf_fd
+ *     parameter above - never closed by this function. SCM_RIGHTS gives the
+ *     host its own independent kernel-level dup.
+ * modifier: pass 0 if not identifiable (as for the generic, non-cros_gralloc
+ *     native_handle_t this project's own NvencEncComponent falls back to
+ *     parsing) - the host re-derives the real modifier for this format
+ *     itself in that case rather than trust a guessed value.
+ *
+ * Returns 0 on success, or a negative errno.
+ */
+int vtest_encode_via_scm(int dmabuf_fd, uint32_t width, uint32_t height, uint32_t drm_format,
+                         uint32_t stride, uint64_t modifier, uint8_t **out_buf,
+                         uint32_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

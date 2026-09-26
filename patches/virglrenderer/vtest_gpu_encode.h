@@ -37,4 +37,12 @@ int vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
                             uint32_t stride, const uint8_t **out_buf,
                             uint32_t *out_len);
 
+/*
+ * Asks the driver for its own real modifier for a DRM format - used by the
+ * SCM_RIGHTS listener (nvenc_scm_listener.c) for buffers whose sender has
+ * no reliable modifier of its own to report. Returns 0
+ * (DRM_FORMAT_MOD_LINEAR) if nothing better is found.
+ */
+uint64_t vtest_gpu_encode_discover_modifier(uint32_t drm_format);
+
 #endif /* VTEST_GPU_ENCODE_H */

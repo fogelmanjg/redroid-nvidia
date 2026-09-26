@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <xf86drm.h>
 
+#include "nvenc_scm_protocol.h"
+
 /* Mirrors nvidia_venus.c's own constants/helpers exactly - kept independent
  * (not #include-shared with minigbm) since this runs in a different process
  * with its own build target, and the pieces needed here are small. */
@@ -157,5 +159,85 @@ int vtest_encode_resource(uint32_t res_id, uint32_t width, uint32_t height,
 
     *out_buf = buf;
     *out_len = nbytes;
+    return 0;
+}
+
+int vtest_encode_via_scm(int dmabuf_fd, uint32_t width, uint32_t height, uint32_t drm_format,
+                         uint32_t stride, uint64_t modifier, uint8_t **out_buf,
+                         uint32_t *out_len) {
+    /* dmabuf_fd is borrowed from the caller's C2Handle/native_handle_t, same
+     * as vtest_encode_resource()'s own res-id-resolution step above - never
+     * closed here. SCM_RIGHTS gives the host its own independent kernel-level
+     * dup; the receiving side (nvenc_scm_listener.c) owns and closes that
+     * copy, not this one. */
+    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (sock < 0) {
+        ALOGE("vtest_encode_via_scm: socket() failed: %s", strerror(errno));
+        return -errno;
+    }
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, NVENC_SCM_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr))) {
+        ALOGE("vtest_encode_via_scm: connect(%s) failed: %s", NVENC_SCM_SOCKET_PATH,
+              strerror(errno));
+        close(sock);
+        return -errno;
+    }
+
+    EncodeRequest req = {};
+    req.width = width;
+    req.height = height;
+    req.drm_format = drm_format;
+    req.stride = stride;
+    req.modifier = modifier;
+
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {.iov_base = &req, .iov_len = sizeof(req)};
+    struct msghdr msg = {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &dmabuf_fd, sizeof(int));
+
+    ssize_t sent = sendmsg(sock, &msg, 0);
+    if (sent < 0) {
+        ALOGE("vtest_encode_via_scm: sendmsg failed: %s", strerror(errno));
+        close(sock);
+        return -errno;
+    }
+
+    EncodeResponse resp;
+    if (sock_read_all(sock, &resp, sizeof(resp))) {
+        ALOGE("vtest_encode_via_scm: read(response header) failed: %s", strerror(errno));
+        close(sock);
+        return -EIO;
+    }
+    if (resp.status != 0) {
+        ALOGE("vtest_encode_via_scm: host status=%d", resp.status);
+        close(sock);
+        return resp.status;
+    }
+
+    uint8_t *buf = (uint8_t *)malloc(resp.coded_size);
+    if (!buf) {
+        close(sock);
+        return -ENOMEM;
+    }
+    if (resp.coded_size && sock_read_all(sock, buf, resp.coded_size)) {
+        ALOGE("vtest_encode_via_scm: read(response body) failed: %s", strerror(errno));
+        free(buf);
+        close(sock);
+        return -EIO;
+    }
+    close(sock);
+
+    *out_buf = buf;
+    *out_len = resp.coded_size;
     return 0;
 }

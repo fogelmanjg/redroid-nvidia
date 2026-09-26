@@ -1997,3 +1997,99 @@ actually finds a resource id (already distinguishable, since it returns 0 on fai
 to the new socket path when it does. Not yet built - the next concrete, well-scoped step, with a
 working reference implementation to adapt sitting in the sibling project rather than needing to be
 invented from scratch.
+
+## 2026-09-26 (same day, continued) — The SCM_RIGHTS transport built and confirmed producing real, valid, decodable NVENC output; two more real bugs found closing the loop with a genuine client
+
+Built the new transport described at the end of the previous entry. `patches/virglrenderer/
+nvenc_scm_protocol.h` defines the wire shape (width/height/drm_format/stride/modifier, an
+`EncodeRequest`/`EncodeResponse` pair - deliberately the same shape as redroid-hwenc's own VA-API
+daemon protocol, since the mechanism is identical). `patches/virglrenderer/nvenc_scm_listener.c`
+runs as its own detached thread inside `virgl_test_server` (started once from `vtest_main`'s own
+entry point, right before the main server loop) - `accept()`s connections, receives an fd via
+`recvmsg()`/`SCM_RIGHTS`, and calls straight into the *existing* `vtest_gpu_encode_dmabuf()` -
+confirmed that function never needed anything Venus-specific, only a dma-buf fd and its layout, so
+zero changes to the actual NVENC/Vulkan/CUDA pipeline were needed, only a new way to reach it.
+Guest side: `vtest_encode_via_scm()` in `vtest_encode_client.cpp`, called from
+`NvencEncComponent::process()` as a fallback exactly when `vtest_encode_resolve_res_id()` returns 0
+(a real, importable dma-buf that isn't a Venus resource) rather than as a replacement for the
+existing, still-correct `VCMD_ENCODE_RESOURCE` path.
+
+**One real correctness bug caught before it shipped**: the initial draft had the SCM listener's fd
+parameter "consumed" the same way redroid-hwenc's own protocol comment describes its dma-buf fd -
+but that daemon's fd is genuinely owned by its sender in a way this project's isn't.
+`dmabufFd` here is *borrowed* from the input `C2Handle`/`native_handle_t` (exactly like the
+existing `vtest_encode_resolve_res_id()` call already treats it) - closing it from
+`vtest_encode_via_scm()` would use-after-close whatever else in the framework still holds that same
+block. Fixed before ever deploying it: the guest side never closes its borrowed fd (SCM_RIGHTS
+already gives the host an independent kernel-level dup), only the *host's own* received copy
+(`vtest_gpu_encode_dmabuf()`'s existing, correct contract) gets closed.
+
+**A second, real design gap, thought through rather than guessed**: this new path has no reliable
+modifier to send - the generic native_handle_t wrapper this component falls back to parsing has no
+identifiable modifier field at all (see the previous entry). Matching redroid-hwenc's own VA-API
+daemon philosophy (*the host determines its own real modifier by asking its own driver*, never
+trusting a value the sender can't actually know), added `vtest_gpu_encode_discover_modifier()` to
+`vtest_gpu_encode.c` - the same non-linear/single-plane/renderable+samplable enumeration
+`vtest_gpu_alloc.c`'s own allocator already uses when it first creates a buffer, reused here as a
+query rather than an allocation. The SCM listener calls it whenever the guest sends modifier `0`
+(its own "don't know" sentinel), overriding the guest's value rather than trusting it.
+
+**First real test, immediately encouraging**: no more `IllegalStateException` from scrcpy at all -
+progress past every previous wall. Real bytes came back (310 for the first frame, 40 for
+subsequent ones) but scrcpy's recorder rejected the stream with `The first video packet is not a
+config packet`. Added a temporary raw-bytes dump on the host side and inspected the actual output
+directly (`ffprobe`): **a completely valid, correctly decodable H.264 stream** - real SPS (`0x67`)
+and PPS (`0x68`) NALs followed by a real IDR slice (`0x65`), `ffprobe` reporting `key_frame=1
+width=720 height=1280 pix_fmt=yuv420p pict_type=I` with zero errors. The NVENC pipeline, the
+SCM_RIGHTS transport, and the modifier auto-discovery are all now confirmed correct on real
+hardware, encoding a real captured Android frame - the remaining gap was purely in how the bytes
+get handed to the framework, not whether they're right.
+
+Two more real, distinct bugs, both found by reading actual reference AOSP source rather than
+guessing at Codec2's own conventions:
+
+1. **NVENC's own default (`repeatSPSPPS=0`) doesn't inline SPS/PPS in-band at all** - they're
+   retrievable once, separately, via `nvEncGetSequenceParams()`, which this module never called.
+   Set `presetcfg.presetCfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1` in
+   `encode_reconfigure_locked()` so every IDR carries its own SPS/PPS inline - confirmed this is
+   what actually produced the SPS/PPS bytes the `ffprobe` dump above depends on.
+2. **A raw Annex-B buffer with inline SPS/PPS still isn't what the framework expects as
+   "the config packet."** Read AOSP's own reference software encoder
+   (`frameworks/av/media/codec2/components/avc/C2SoftAvcEnc.cpp`) rather than guess: on a
+   component's first output work, it wraps just the header bytes in a
+   `C2StreamInitDataInfo::output` and pushes it onto `work->worklets.front()->output.configUpdate`
+   - a *separate* channel from the regular output buffer, not something inferred from buffer
+   content. Added the same shape to `NvencEncComponent::process()`: on the first successful encode
+   only, scans the returned bytes for the first VCL NAL (slice types 1-5, distinguishable from SPS/
+   PPS/other NAL types safely since H.264's own emulation-prevention bytes make a genuine start
+   code sequence impossible to occur by coincidence inside NAL payloads), splits everything before
+   it into a `C2StreamInitDataInfo`, and sends only the frame portion as the regular buffer from
+   then on.
+
+**Not yet confirmed working end to end** - a real, separate design gap surfaced immediately after
+deploying this fix, before it could be properly exercised: the persistent host-side encoder session
+(`vtest_gpu_encode.c`'s own `enc` struct, by design reused across calls - see the 2026-09-25 Tier 7
+entries for why) only re-initializes NVENC (where `repeatSPSPPS` lives) on a *resolution* change,
+never on a genuinely new streaming session at the same resolution. A guest-side container restart
+without a matching *host-side* vtest-server restart reconnects into the same persistent, already-
+"warmed" encoder state, which correctly continues emitting P-frames rather than a fresh IDR+SPS/PPS
+- meaning the CSD-split fix's own retest kept receiving 40-byte P-frame-shaped buffers with nothing
+to split, not a failure of the split logic itself. This is a real, well-understood gap with a known
+shape (the reference `C2SoftAvcEnc.cpp` handles the equivalent case via
+`C2StreamRequestSyncFrameTuning` - explicit "give me a fresh IDR now" signaling from the framework,
+which this component doesn't implement yet) - the concrete next item, not a mystery.
+
+**A separate, real operational finding, worth flagging even though it's not this session's bug to
+fix**: forcing `cmd device_config put codec_fwk aidl_hal true` (needed - see the previous session's
+own finding that `Codec2Client::GetServiceNames()` never even queries the `default` AIDL store
+without it) persists across container restarts (`device_config`'s backing store lives in
+`/data/misc/`, unlike `setprop`), and after several rapid restart cycles in the same session,
+`zygote` itself began crash-looping (`ServerConfigurableFlagsReset ... updatable crashing
+detected`), taking `netd` down with it and breaking host-to-container networking entirely (the
+actual proximate symptom hit: `ping` to the container's own bridge IP returning "Destination Host
+Unreachable"). Not confirmed whether the `aidl_hal` flag itself is the trigger or a coincidence of
+this session's unusually high restart cadence - a fresh container from the same image, with the
+flag never set, also hit a boot hang once under the same rapid-restart conditions, then booted
+clean on the very next attempt with no changes at all. Logged as a real, reproducible-enough
+caution for next time (avoid rapid-fire container/vtest-server restarts back to back; give each one
+time to fully settle) rather than a confirmed root cause.

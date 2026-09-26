@@ -230,27 +230,76 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
         return;
     }
     uint32_t resId = vtest_encode_resolve_res_id(fd, dmabufFd);
-    if (!resId) {
-        ALOGE("failed to resolve a Venus resource id for this buffer");
-        work->result = C2_CORRUPTED;
-        work->workletsProcessed = 1u;
-        return;
-    }
 
     uint8_t *coded = nullptr;
     uint32_t codedSize = 0;
-    int ret = vtest_encode_resource(resId, width, height, drmFormat, stride, formatModifier,
+    int ret;
+    if (resId) {
+        /* A genuine Venus-owned resource (e.g. this project's own allocation
+         * path, or a hand-built C2Work test) - the proven, three-spikes-deep
+         * VCMD_ENCODE_RESOURCE path. */
+        ret = vtest_encode_resource(resId, width, height, drmFormat, stride, formatModifier,
                                      &coded, &codedSize);
+        if (ret) ALOGE("vtest_encode_resource failed: %d", ret);
+    } else {
+        /* A real, importable dma-buf that simply was never registered as a
+         * Venus resource (confirmed 2026-09-26: this is exactly what a real
+         * Surface-sourced GraphicBufferSource capture buffer is, on this
+         * project's own NVIDIA/cros_gralloc stack) - VCMD_ENCODE_RESOURCE
+         * fundamentally cannot name it, no matter how correctly it's parsed.
+         * Fall back to the SCM_RIGHTS transport instead. */
+        ret = vtest_encode_via_scm(dmabufFd, width, height, drmFormat, stride, formatModifier,
+                                    &coded, &codedSize);
+        if (ret) ALOGE("vtest_encode_via_scm failed: %d", ret);
+    }
     if (ret) {
-        ALOGE("vtest_encode_resource failed: %d", ret);
         work->result = C2_CORRUPTED;
         work->workletsProcessed = 1u;
         return;
     }
 
+    // Same reasoning as the reference C2SoftAvcEnc: the framework (and a real
+    // client, scrcpy, confirmed the hard way) expects the very first output
+    // work to carry the SPS/PPS as a separate C2StreamInitDataInfo, not just
+    // an Annex-B buffer that happens to have them inline first - even though
+    // NVENC's repeatSPSPPS setting (vtest_gpu_encode.c) does put genuinely
+    // valid, ffprobe-decodable SPS+PPS+IDR bytes in that first buffer.
+    // Splits off everything before the first VCL NAL (slice types 1-5) as
+    // the CSD; only fires once, since repeatSPSPPS only repeats on IDRs and
+    // this component's own first call is always this stream's first IDR.
+    uint32_t frameOffset = 0;
+    if (!mCsdSent) {
+        for (uint32_t i = 0; i + 4 < codedSize; i++) {
+            bool startCode3 = coded[i] == 0 && coded[i + 1] == 0 && coded[i + 2] == 1;
+            bool startCode4 =
+                    startCode3 == false && coded[i] == 0 && coded[i + 1] == 0 &&
+                    coded[i + 2] == 0 && coded[i + 3] == 1;
+            if (!startCode3 && !startCode4) continue;
+            uint32_t nalOffset = i + (startCode4 ? 4 : 3);
+            uint32_t nalType = coded[nalOffset] & 0x1f;
+            if (nalType >= 1 && nalType <= 5) {
+                frameOffset = nalOffset - (startCode4 ? 4 : 3);
+                break;
+            }
+        }
+        if (frameOffset > 0) {
+            std::unique_ptr<C2StreamInitDataInfo::output> csd =
+                    C2StreamInitDataInfo::output::AllocUnique(frameOffset, 0u);
+            if (csd) {
+                memcpy(csd->m.value, coded, frameOffset);
+                work->worklets.front()->output.configUpdate.push_back(std::move(csd));
+                mCsdSent = true;
+            } else {
+                ALOGE("CSD allocation failed, sending SPS/PPS inline instead");
+                frameOffset = 0;
+            }
+        }
+    }
+    const uint32_t frameSize = codedSize - frameOffset;
+
     std::shared_ptr<C2LinearBlock> outBlock;
     C2MemoryUsage usage = {C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE};
-    c2_status_t err = pool->fetchLinearBlock((size_t)codedSize, usage, &outBlock);
+    c2_status_t err = pool->fetchLinearBlock((size_t)frameSize, usage, &outBlock);
     if (err != C2_OK) {
         ALOGE("fetchLinearBlock failed: %d", err);
         free(coded);
@@ -267,11 +316,11 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
             work->workletsProcessed = 1u;
             return;
         }
-        memcpy(wView.base(), coded, codedSize);
+        memcpy(wView.base(), coded + frameOffset, frameSize);
     }
     free(coded);
 
-    std::shared_ptr<C2Buffer> outBuffer = createLinearBuffer(outBlock, 0, codedSize);
+    std::shared_ptr<C2Buffer> outBuffer = createLinearBuffer(outBlock, 0, frameSize);
     outBuffer->setInfo(
             std::make_shared<C2StreamPictureTypeMaskInfo::output>(0u, C2Config::SYNC_FRAME));
 
@@ -281,7 +330,8 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
     work->worklets.front()->output.ordinal = work->input.ordinal;
     work->workletsProcessed = 1u;
 
-    ALOGD("encoded %u bytes via VCMD_ENCODE_RESOURCE (res_id=%u)", codedSize, resId);
+    ALOGD("encoded %u bytes via %s", codedSize,
+          resId ? "VCMD_ENCODE_RESOURCE" : "SCM_RIGHTS fallback");
 }
 
 }  // namespace android

@@ -523,6 +523,15 @@ encode_reconfigure_locked(uint32_t width, uint32_t height, uint64_t modifier,
     * (no B-frame reordering) so every NvEncEncodePicture has an immediately
     * lockable bitstream, never NV_ENC_ERR_NEED_MORE_INPUT. */
    presetcfg.presetCfg.frameIntervalP = 1;
+   /* NVENC's default (repeatSPSPPS=0) only emits SPS/PPS once, out-of-band,
+    * retrievable separately via nvEncGetSequenceParams() - not useful here,
+    * since each caller (VCMD_ENCODE_RESOURCE, the SCM_RIGHTS listener) reads
+    * one self-contained Annex-B buffer per call with no shared decoder state
+    * across calls. Force every IDR to carry its own SPS/PPS inline instead,
+    * so each response is independently decodable - confirmed necessary: a
+    * real client (scrcpy) rejected the very first response with "the first
+    * video packet is not a config packet" until this was set. */
+   presetcfg.presetCfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
 
    NV_ENC_INITIALIZE_PARAMS init;
    memset(&init, 0, sizeof(init));
@@ -569,6 +578,74 @@ encode_reconfigure_locked(uint32_t width, uint32_t height, uint64_t modifier,
    enc.cur_h = height;
    (void)modifier;
    return 0;
+}
+
+/*
+ * Discovers the driver's own real modifier for a format, the same way
+ * vtest_gpu_alloc.c's own allocator does when it first creates a buffer
+ * (enumerate what the format supports, non-linear, single-plane,
+ * renderable+samplable) - used for the SCM_RIGHTS path (see
+ * nvenc_scm_listener.c), where the sending side (a Codec2 component reading
+ * an opaque, non-cros_gralloc native_handle_t it can't fully decode) has no
+ * reliable way to report the buffer's true modifier itself. Matches
+ * redroid-hwenc's own VA-API daemon philosophy exactly: let the host
+ * determine its own real modifier by asking its own driver, rather than
+ * trust a value the sender can't actually know. Deliberately does not
+ * create an image to read back GetImageDrmFormatModifierPropertiesEXT's
+ * "chosen" value the way the allocator does - in practice this driver
+ * exposes exactly one non-linear candidate per format, so the first match
+ * from the enumeration is that same answer without the extra round trip.
+ * Returns 0 (DRM_FORMAT_MOD_LINEAR) if nothing better is found - not a
+ * likely correct answer for a real composited surface, but a safe,
+ * deterministic fallback that fails the subsequent import cleanly instead
+ * of silently using a stale value from a previous call.
+ */
+uint64_t
+vtest_gpu_encode_discover_modifier(uint32_t drm_format)
+{
+   const VkFormat format = drm_format_to_vk(drm_format);
+   if (format == VK_FORMAT_UNDEFINED)
+      return 0;
+
+   pthread_mutex_lock(&enc_mutex);
+   int ret = encode_init_locked();
+   if (ret) {
+      pthread_mutex_unlock(&enc_mutex);
+      return 0;
+   }
+
+#define GET_INST(name) PFN_vk##name name = (PFN_vk##name)enc.GetInstanceProcAddr(enc.instance, "vk" #name)
+   GET_INST(GetPhysicalDeviceFormatProperties2);
+#undef GET_INST
+   uint64_t chosen = 0;
+   if (GetPhysicalDeviceFormatProperties2) {
+      VkDrmFormatModifierPropertiesListEXT mod_list = {
+         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+      };
+      VkFormatProperties2 fmt_props = {
+         .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+         .pNext = &mod_list,
+      };
+      GetPhysicalDeviceFormatProperties2(enc.phys, format, &fmt_props);
+      VkDrmFormatModifierPropertiesEXT props[64];
+      mod_list.drmFormatModifierCount =
+         mod_list.drmFormatModifierCount < 64 ? mod_list.drmFormatModifierCount : 64;
+      mod_list.pDrmFormatModifierProperties = props;
+      GetPhysicalDeviceFormatProperties2(enc.phys, format, &fmt_props);
+
+      const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+      for (uint32_t i = 0; i < mod_list.drmFormatModifierCount; i++) {
+         if (props[i].drmFormatModifierPlaneCount == 1 &&
+             (props[i].drmFormatModifierTilingFeatures & need) == need &&
+             props[i].drmFormatModifier != 0) {
+            chosen = props[i].drmFormatModifier;
+            break;
+         }
+      }
+   }
+   pthread_mutex_unlock(&enc_mutex);
+   return chosen;
 }
 
 int

@@ -157,3 +157,18 @@ resolve a resource id that was never registered, regardless of how correctly the
 real kernel between guest and host), as a second path alongside the existing, still-correct
 `VCMD_ENCODE_RESOURCE` path for genuinely Venus-owned resources. See the main `README.md`'s Tier 7
 section and `DEVLOG.md`'s 2026-09-26 entries for the full reasoning.
+
+**Update, 2026-09-26 (same day, part 4): that transport is built, and check 3 is real, valid, NVENC-
+encoded H.264 from a genuine captured frame** — confirmed directly with `ffprobe` (real SPS/PPS/IDR
+NALs, correct dimensions, zero parse errors), not inferred. `vtest_encode_via_scm()`
+(`vtest_encode_client.{h,cpp}`) sends the borrowed dma-buf fd over `SCM_RIGHTS` to a new host-side
+listener (`patches/virglrenderer/nvenc_scm_listener.c`) whenever `vtest_encode_resolve_res_id()`
+returns no resource id; `NvencEncComponent::process()` picks between it and the original
+`VCMD_ENCODE_RESOURCE` path automatically. Getting a real client (`scrcpy`) to actually accept the
+result needed two more fixes, both found by reading real reference source rather than guessing:
+NVENC's own `repeatSPSPPS` config (off by default) and a proper `C2StreamInitDataInfo`/`configUpdate`
+split on the component's first output work, mirroring AOSP's own reference `C2SoftAvcEnc.cpp`
+exactly. **Not yet confirmed end to end** — a real gap in the persistent host-side encoder session
+(it only re-initializes NVENC on a resolution change, never on a genuinely new stream at the same
+resolution) meant the CSD fix's own retest never got a fresh IDR to split in the first place. See
+`DEVLOG.md`'s 2026-09-26 (continued) entry for the full detail, including a `C2StreamRequestSyncFrameTuning`-shaped next step and an operational caution about rapid-fire container restarts.

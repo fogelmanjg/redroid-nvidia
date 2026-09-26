@@ -546,13 +546,46 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       shares one real kernel between guest and host, a dma-buf fd can move directly over a plain
       Unix domain socket with `SCM_RIGHTS`, no Venus/resource-id abstraction needed at all.
 
-      **What's left, cleanly scoped for the next session**: a new, small `SCM_RIGHTS`-based listener
-      (adapting redroid-hwenc's own already-working daemon code almost directly — the underlying
-      mechanism is identical), with `NvencEncComponent::process()` picking the right transport based
-      on whether `vtest_encode_resolve_res_id()` finds a real resource id or not. Once that's in
-      place, closing Tier 7 completely — and, if the theory holds, eliminating the earlier session's
-      observed software-encoder corruption entirely by construction — is the next real checkpoint.
-      See [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
+      **Same day, continued — the SCM_RIGHTS transport built, and real, valid, `ffprobe`-decodable
+      NVENC output confirmed from a genuine captured Android frame for the first time.** Built
+      exactly the transport the previous entry called for: a new listener thread inside
+      `virgl_test_server` (`patches/virglrenderer/nvenc_scm_listener.c`) receiving a dma-buf fd via
+      `SCM_RIGHTS`, calling straight into the *existing* `vtest_gpu_encode_dmabuf()` — confirming
+      that function never needed anything Venus-specific in the first place, only a fd and its
+      layout. `NvencEncComponent::process()` now picks this path automatically whenever
+      `vtest_encode_resolve_res_id()` finds no resource id. One real correctness bug caught before
+      shipping (the guest-side fd is *borrowed* from the input block, same as the existing
+      resource-id path already treats it — never closed, unlike redroid-hwenc's own daemon protocol
+      comment which assumes ownership its own dma-buf genuinely has); one real design gap solved by
+      directly mirroring redroid-hwenc's own philosophy (a new `vtest_gpu_encode_discover_modifier()`
+      lets the host ask its own driver for the real modifier, since this transport's sender has no
+      reliable one of its own to offer). First real test: no more `IllegalStateException` at all —
+      real bytes came back, but scrcpy's recorder rejected them as missing a "config packet."
+      Dumped the raw bytes and inspected them directly with `ffprobe` rather than guess: **a fully
+      valid, correctly decodable H.264 stream** — real SPS/PPS/IDR NALs, `key_frame=1 width=720
+      height=1280 pix_fmt=yuv420p` with zero errors. Two more real bugs, both found by reading
+      actual AOSP reference source rather than guessing Codec2's own conventions: NVENC's own
+      default doesn't inline SPS/PPS at all (fixed: `repeatSPSPPS=1`), and the framework doesn't
+      infer "this is the config packet" from buffer content — it needs a separate
+      `C2StreamInitDataInfo` in `configUpdate`, the same shape AOSP's own reference software AVC
+      encoder uses (added a first-call NAL scan to split it out).
+
+      **Not yet confirmed working end to end**: a real design gap surfaced immediately after,
+      before the CSD fix could be properly re-exercised — the persistent host-side encoder session
+      only re-initializes NVENC (where `repeatSPSPPS` lives) on a resolution change, never on a
+      genuinely new streaming session at the same resolution, so a guest restart without a matching
+      host-side vtest-server restart silently continues an already-"warmed" session instead of
+      producing a fresh IDR. This is a real, well-understood gap with a known shape (the reference
+      encoder handles the equivalent case via `C2StreamRequestSyncFrameTuning`, not yet implemented
+      here) — the next concrete step, not a mystery. A separate, real operational finding from the
+      same session, logged as a caution rather than a confirmed root cause: persisting
+      `device_config codec_fwk aidl_hal=true` across several rapid container/vtest-server restarts
+      in a row coincided with `zygote` crash-looping and taking `netd` (and host-to-container
+      networking) down with it — not confirmed as cause vs. coincidence, but worth avoiding rapid-
+      fire restarts back to back regardless.
+
+      See DEVLOG's 2026-09-26 entries for the full detail, and
+      [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
       external to the repo) for the host-prerequisite checklist this session re-applied after a
       clean reboot.
 
