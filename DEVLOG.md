@@ -2428,9 +2428,65 @@ the modifier-candidate selection (kept, matters for the still-separate `VCMD_ENC
 transport, which really can carry non-zero source modifiers), the explicit-layout rowPitch source
 (kept, same reasoning), the display-vs-real buffer width mismatch (kept, load-bearing), the
 wrongly-overridden source modifier (the actual root cause of the checkerboard), and copy_image's
-modifier wrongly tied to the source's (the actual root cause of the final shear). **Next session**:
-characterize the remaining scanline dropout - likely a producer-side synchronization gap (the
-earlier-tried `block.fence().wait()` in `NvencEncComponent.cpp` failed at the Vulkan-semaphore-import
-layer specifically, which doesn't rule out synchronization in general, just that specific
-primitive); consider a plain kernel-level `DMA_BUF_IOCTL_SYNC` wait instead, since redroid's shared
-kernel makes that available without needing a Vulkan/CUDA fence import at all.
+modifier wrongly tied to the source's (the actual root cause of the final shear). A fifth real bug
+found and fixed the same day: `copy_image`'s NVENC `bufferFormat` was hardcoded to
+`NV_ENC_BUFFER_FORMAT_ARGB` regardless of the source's real channel order, producing a visible R/B
+channel swap - fixed by deriving it from the actual format instead.
+
+### 2026-09-26 (same day, one more round): cross-machine GPU/driver comparison - the remaining artifact is a real, systemic NVIDIA driver limitation, not this project's bug
+
+User's own question, and a good one: how much of the remaining scanline dropout is this project's
+code versus something about this specific GPU/driver not being fully supported? Tested by standing
+up the exact same pipeline - literally the same container image, `docker commit`-snapshotted off the
+working jgustavo48 setup and transferred whole, plus the same host binaries - on **jgustavo47** (GTX
+1050 Ti, Pascal, driver 580.105.08, notably *older* than the 595.71+ waydroid-nvidia's own write-up
+documents as the minimum for this whole Venus approach).
+
+Getting there needed fixing three real host prerequisites, none of them GPU-related: missing
+`ext4`/`erofs` kernel modules (Android's APEX packages loop-mount as one of these; a host that never
+needed either had neither loaded - a documented gotcha from this same fleet's own jgustavo46 bring-up
+history), `/dev/binder`/`hwbinder`/`vndbinder` created `0600` instead of `0666` by a bare `modprobe`,
+and `virgl_test_server`'s own `virgl_render_server` helper missing from its hardcoded install path
+(`/usr/local/libexec/`) - none of these are specific to this project or to NVIDIA, just gaps from a
+host that had never run redroid before.
+
+**With those fixed, both encoders on the 1050 Ti are clean** - no scanline dropout, no color swap,
+software and NVENC output visually indistinguishable from each other. A direct Vulkan probe
+confirmed both GPUs expose the *same* DRM modifier structure for this format (7 candidates: 6
+non-linear block-linear variants plus linear, same low-nibble block-height encoding, just a
+different chip-family ID baked into the modifier) - so it isn't that the older card has less tiling
+complexity to get right.
+
+**The actual mechanism, found by re-testing `block.fence().wait()` a second time** (the user's own
+suggestion, after proposing and then talking ourselves out of a full EGL-native-fence-sync
+experiment): re-added it with proper logging, rebuilt, redeployed. Result: `wait()` returns `C2_OK`
+(`valid=1 ready=1`) on every call, while the kernel logs `nv_drm_prime_fence_context_create_ioctl:
+Failed to import fence semaphore surface` at the same rate underneath it - i.e. libui's `Fence::wait()`
+(confirmed by reading its actual source, `vndk/C2Fence.cpp` → `ui/Fence.h`: it's already a plain
+`sync_wait()` on the fence's own fd, not some higher-level Vulkan/EGL-specific mechanism) fails open
+(reports ready) rather than blocking when the driver can't resolve the fence, rather than actually
+protecting anything - confirming the original revert's finding still holds, this time with the two
+independently-fixed bugs from earlier today ruled out as a co-factor. Reverted again (kept as a
+documented, clearly-explained no-op) rather than left in, since it only adds kernel log spam.
+
+**The real finding**: this same kernel error fires continuously - roughly every 100ms, matching a
+composition/vsync cadence - with the fence-wait line removed from this project's code entirely,
+confirming it's *not specific to this encode path at all*. Something in Android's own normal
+graphics stack (SurfaceFlinger/HWComposer's own internal presentation-fence handling) already hits
+this same NVIDIA driver limitation continuously, independent of NVENC or even scrcpy running at all.
+Checked jgustavo47 for the same signature under equivalent load: **zero occurrences**. This is a
+real, systemic gap in this specific NVIDIA driver version's (595.91.07) support for importing a
+"prime fence" across this project's own guest/host-shared-kernel usage pattern on this GPU
+architecture (Ada) - not something reachable from userspace on the guest side at all (Vulkan, EGL,
+CUDA all need the identical kernel primitive to mean anything), and not a flaw in this project's own
+code, since the identical code and container are clean on different hardware. The older/slower GPU
+very likely just has enough natural timing margin in its own composition pipeline that the missing
+real synchronization never gets exercised badly enough to visibly tear a frame - not because
+anything is actually correct there either.
+
+**Practical conclusion**: the scanline dropout on the RTX 4060 is a known, characterized, driver-level
+limitation with no fix reachable from this project's own code. Given its low severity (thin,
+scattered dropout - not the earlier checkerboard/shear corruption, both of which *were* real bugs in
+this project's own code and are now fixed) and that it doesn't reproduce on other supported hardware,
+it's reasonable to document and accept it rather than keep chasing a fix that depends on NVIDIA's own
+driver team.

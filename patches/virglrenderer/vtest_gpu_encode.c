@@ -396,7 +396,7 @@ encode_init_locked(void)
 /* (Re)creates the persistent copy target + NVENC registration for a new
  * resolution. Tears down the previous one first, if any. */
 static int
-encode_reconfigure_locked(uint32_t width, uint32_t height, uint64_t modifier,
+encode_reconfigure_locked(uint32_t width, uint32_t height, VkFormat format, uint64_t modifier,
                           const uint64_t *mod_candidates, uint32_t mod_count)
 {
    if (enc.registered) {
@@ -421,7 +421,6 @@ encode_reconfigure_locked(uint32_t width, uint32_t height, uint64_t modifier,
       enc.copy_memory = VK_NULL_HANDLE;
    }
 
-   const VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
    const VkExternalMemoryImageCreateInfo ext_info = {
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
       .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
@@ -564,6 +563,23 @@ encode_reconfigure_locked(uint32_t width, uint32_t height, uint64_t modifier,
    if (nvst != NV_ENC_SUCCESS)
       return -EIO;
 
+   /*
+    * Real, load-bearing finding (2026-09-26): this field was hardcoded to
+    * NV_ENC_BUFFER_FORMAT_ARGB (memory byte order B,G,R,A - matching the
+    * copy_image format this function used to hardcode too,
+    * VK_FORMAT_B8G8R8A8_UNORM) regardless of what format the SOURCE buffer
+    * actually was. A real capture buffer on this stack is AB24/ABGR8888
+    * (memory order R,G,B,A - VK_FORMAT_R8G8B8A8_UNORM, confirmed by
+    * NvencEncComponent.cpp's own wrapper-parsing comment), which the fix
+    * above now correctly carries through as this function's own `format`
+    * parameter instead of silently discarding it. Mismatching NVENC's
+    * bufferFormat against copy_image's real byte order doesn't fail or
+    * corrupt structurally - vkCmdCopyImage happily does a raw byte copy
+    * between same-sized formats - but every reader downstream (NVENC here,
+    * any decoder after it) reinterprets the same R,G,B,A bytes as B,G,R,A,
+    * swapping the R and B channels in the final picture. Deriving this
+    * from the real `format` instead of hardcoding it fixes that for
+    * whichever of the two layouts this project ever actually sees. */
    NV_ENC_REGISTER_RESOURCE reg;
    memset(&reg, 0, sizeof(reg));
    reg.version = MKVER(5);
@@ -572,7 +588,8 @@ encode_reconfigure_locked(uint32_t width, uint32_t height, uint64_t modifier,
    reg.height = height;
    reg.pitch = width * 4;
    reg.resourceToRegister = cuarr;
-   reg.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+   reg.bufferFormat = (format == VK_FORMAT_R8G8B8A8_UNORM) ? NV_ENC_BUFFER_FORMAT_ABGR
+                                                           : NV_ENC_BUFFER_FORMAT_ARGB;
    reg.bufferUsage = NV_ENC_INPUT_IMAGE;
    nvst = enc.fn.nvEncRegisterResource(enc.encoder, &reg);
    if (nvst != NV_ENC_SUCCESS)
@@ -910,10 +927,14 @@ vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                            VK_IMAGE_USAGE_SAMPLED_BIT |
                                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-      uint64_t copy_modifier =
-         discover_modifier_locked(VK_FORMAT_B8G8R8A8_UNORM, width, height, copy_usage);
+      /* copy_image must match the SOURCE's real channel order (`format`) -
+       * previously hardcoded to VK_FORMAT_B8G8R8A8_UNORM regardless of the
+       * source, which silently swapped R and B whenever the source was
+       * actually R8G8B8A8_UNORM (AB24, confirmed the common case). See
+       * encode_reconfigure_locked()'s own comment on reg.bufferFormat. */
+      uint64_t copy_modifier = discover_modifier_locked(format, width, height, copy_usage);
       uint64_t mods[1] = { copy_modifier };
-      ret = encode_reconfigure_locked(width, height, copy_modifier, mods, 1);
+      ret = encode_reconfigure_locked(width, height, format, copy_modifier, mods, 1);
       if (ret)
          goto out;
    }

@@ -183,15 +183,27 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
     // vtest_gpu_encode.c, unlike VA-API's daemon, currently trusts whatever
     // modifier the wire protocol sends for the plain-import step).
     C2ConstGraphicBlock block = inputBuffer->data().graphicBlocks().front();
-    // Tried waiting on block.fence() here on the theory that the GPU
-    // compositor might still be writing when process() runs (every frame
-    // came back uniformly black without it). Reverted: the wait itself
-    // fails at the driver level every single call
-    // (nv_drm_prime_fence_context_create_ioctl: "Failed to import fence
-    // semaphore surface", confirmed correlated 1:1 with encode calls, zero
-    // occurrences otherwise) rather than actually blocking, so it protects
-    // nothing in this environment - and frames were still black anyway. The
-    // real cause is still open; see DEVLOG's 2026-09-26 entry.
+    // Re-tried block.fence().wait() a second time (2026-09-26, later the same
+    // day) after fixing three unrelated real bugs downstream, on the theory
+    // that one of those might have been the actual cause of the original
+    // "fails at the driver level" observation. It wasn't: confirmed via
+    // C2Fence::wait()'s own source (vndk/C2Fence.cpp) that this already goes
+    // through the most generic mechanism available - android::Fence::wait(),
+    // a plain sync_wait() on the fence's own fd, no Vulkan/EGL/CUDA-specific
+    // import involved at all. Re-tested anyway with logging: wait() returns
+    // C2_OK (valid=1 ready=1) on every single call, while the kernel logs
+    // "nv_drm_prime_fence_context_create_ioctl: Failed to import fence
+    // semaphore surface" at the exact same rate underneath it - i.e. the
+    // driver can't actually resolve this fence's real completion state, and
+    // C2Fence/libui's wait() fails open (reports ready) rather than blocking
+    // when that happens. Since every fence-waiting API on Android ultimately
+    // needs this same kernel-level primitive to mean anything, EGL/Vulkan/
+    // CUDA fence import would all hit this identical wall - there is no
+    // "lower-level" fence mechanism left to try. This isn't a bug this
+    // project's own code can fix; it needs NVIDIA's driver to support
+    // importing a prime fence across this process/context boundary. Left
+    // out again - it adds kernel log spam without providing any real
+    // protection. See DEVLOG's 2026-09-26 entries for the full history.
     const C2Handle *const handle = block.handle();
     if (!handle || handle->numFds < 1) {
         ALOGE("input graphic block has no dma-buf fd");
