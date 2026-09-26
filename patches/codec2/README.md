@@ -117,3 +117,25 @@ session's task is purely "deploy this service into a running container and drive
 get a container to boot at all." The corruption bug from the stock software encoder was also
 observed live for the first time in this same session — real but minor (roughly one bad frame here
 and there, self-correcting), which is the honest baseline this component is meant to improve on.
+
+**Update, 2026-09-26 (deployment session, part 2, see DEVLOG): check 1 is now CONFIRMED, check 2 is
+now a concrete, in-progress data problem instead of an open question.** Deployed the service for
+real (full transitive shared-library closure via `readelf -d` + a recursive resolve against the
+AOSP build's own `vendor/lib64/` — 45 libraries, one pass, no more one-crash-per-fix loop), fixed
+two real gaps beyond that (`androidboot.use_redroid_c2=1` needed on the container's own `/init`
+cmdline; the deployed `/vendor/etc/media_codecs.xml` predated the `<MediaCodec>` line already
+correct in the source tree). Result: `c2.hardware.encoder.h264 (hw) [vendor]` in a real `scrcpy
+--list-encoders` — **check 1 confirmed, on real hardware, by a genuine framework client, no
+disabling of the stock service needed** (it turned out to be a wrong assumption in this file's own
+earlier text — the stock store is named `/software`, coexists fine with a new `/default`). Driving
+it for real then hit check 2 head-on: `NvencEncComponent`'s own `cros_gralloc_handle_t` size check
+rejects the actual Surface-sourced buffer (`numFds=1 numInts=46`, vs. 36 expected) — **check 2's
+answer is confirmed no**, matching `VaapiEncComponent`'s own documented AMD/Intel finding.
+Diagnostic logging (kept in the component, see the `ALOGE` calls around the size check in
+`process()`) captured real, consistent raw bytes: width (720), height (1280), and a DRM fourcc
+(`ABGR8888`) all recognizable at fixed offsets, plus a stride-shaped value matching Tier 5's own
+already-known `3072`-byte stride — but the wrapper type itself isn't identified yet (its apparent
+magic constant, `0xabcddcba`, matches nothing in this project's own AOSP tree). **Next session**:
+turn this raw capture into a second parsing path in `process()`, the same shape as
+`VaapiEncComponent`'s own non-cros_gralloc fallback, then check 3 (the actual encode round trip) is
+what's left to close the whole arc.

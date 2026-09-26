@@ -10,6 +10,9 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <cstdio>
+#include <string>
+
 #include <log/log.h>
 #include <media/stagefright/MediaDefs.h>
 #include <util/C2InterfaceHelper.h>
@@ -171,8 +174,25 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
     }
     if (sizeof(native_handle_t) + sizeof(int) * (size_t)(handle->numFds + handle->numInts) !=
         sizeof(cros_gralloc_handle)) {
-        ALOGE("input handle isn't a cros_gralloc_handle (numFds=%d numInts=%d)", handle->numFds,
-              handle->numInts);
+        ALOGE("input handle isn't a cros_gralloc_handle (numFds=%d numInts=%d, expected total "
+              "%zu ints for a real cros_gralloc_handle)",
+              handle->numFds, handle->numInts,
+              (sizeof(cros_gralloc_handle) - sizeof(native_handle_t)) / sizeof(int));
+        {
+            const int32_t *raw = handle->data;
+            std::string fdsDump, intsDump;
+            for (int i = 0; i < handle->numFds; i++) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%d ", raw[i]);
+                fdsDump += buf;
+            }
+            for (int i = 0; i < handle->numInts; i++) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "0x%x ", raw[handle->numFds + i]);
+                intsDump += buf;
+            }
+            ALOGE("raw handle dump: fds=[%s] ints=[%s]", fdsDump.c_str(), intsDump.c_str());
+        }
         work->result = C2_CORRUPTED;
         work->workletsProcessed = 1u;
         return;

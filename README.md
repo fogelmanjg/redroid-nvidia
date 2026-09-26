@@ -493,15 +493,45 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       not yet set up, not yet needed, but now a known, understood prerequisite rather than a
       surprise for next time.
 
-      **What's left, cleanly scoped for the next session**: deploy the actual
-      `android.hardware.media.c2-nvenc-service` binary (already built, see above) into a running
-      container, disable/replace the stock default Codec2 service so `c2.hardware.encoder.h264`
-      registers as `IComponentStore/default`, and get `scrcpy`/`MediaCodec` to actually pick it —
-      closing Tier 7 end to end and, if the theory holds, eliminating this session's observed
-      corruption entirely by construction (NVENC never reads the tiled surface through the CPU at
-      all). See DEVLOG's 2026-09-25 (fourth session) entry for the full blow-by-blow, and
+      **Fifth session, next day — the service actually deployed, registered, and picked by a real
+      app for the first time, and the real remaining bug is now a data problem, not a plumbing
+      one.** Checked `redroid-hwenc`'s own history first, since it already solved this exact class
+      of deployment problem for VA-API — corrected a wrong assumption in this project's own
+      `patches/codec2/README.md` along the way (no need to disable the stock service at all; the
+      stock store is named `/software`, a new `/default` store coexists fine). Resolved the full
+      transitive shared-library closure in one pass (`readelf -d` + a recursive walk against the
+      AOSP build's own `vendor/lib64/`, 45 libraries, deployed as one tarball) instead of the
+      slow one-crash-per-fix loop every earlier session used — a real process improvement worth
+      keeping. Found and fixed two real deployment gaps beyond that: `androidboot.use_redroid_c2=1`
+      needed adding to the container's own `/init` cmdline args (redroid's `docker run` `CMD` *is*
+      `/init`'s argv), and the deployed `/vendor/etc/media_codecs.xml` predated the
+      `<MediaCodec name="c2.hardware.encoder.h264">` line already sitting correctly in the source
+      tree — redeployed the file wholesale after diffing to confirm that was the only difference.
+      **Result: `c2.hardware.encoder.h264 (hw) [vendor]` appeared in a real `scrcpy
+      --list-encoders` run** — the same milestone line redroid-hwenc's own DEVLOG recorded for
+      VA-API, now true for NVENC. Driving it for real hit exactly the next wall redroid-hwenc's own
+      history predicted: the component's `cros_gralloc_handle_t` size/magic validation rejects the
+      real Surface-sourced input buffer outright (`numFds=1 numInts=46`, vs. 36 for a genuine
+      `cros_gralloc_handle_t`) — confirming, on this project's own NVIDIA stack, the same finding
+      `VaapiEncComponent`'s own header already documented on AMD/Intel: a real captured frame does
+      not arrive as the gralloc HAL's own native struct. Added temporary diagnostic logging,
+      rebuilt (~17s, incremental), and captured real, consistent raw bytes to decode from — width
+      (720), height (1280), and a DRM fourcc (`ABGR8888`) all recognizable at fixed offsets, plus a
+      stride-shaped value matching Tier 5's own already-known `3072`-byte stride for this exact
+      buffer — but the wrapper type itself isn't yet identified (its apparent magic constant,
+      `0xabcddcba`, matches nothing in this project's own AOSP tree, so it's very likely produced by
+      a prebuilt component with no local source). See DEVLOG's 2026-09-26 entry for the full
+      byte-level detail and the four deployment bugs' exact fixes.
+
+      **What's left, cleanly scoped for the next session**: turn this session's raw byte capture
+      into a second, fallback parsing path in `NvencEncComponent::process()` — exactly mirroring how
+      `VaapiEncComponent` itself grew a non-cros_gralloc fallback for its own equivalent discovery —
+      then get an actual encoded frame out the other end, closing Tier 7 completely and, if the
+      theory holds, eliminating the earlier session's observed software-encoder corruption entirely
+      by construction (NVENC never reads the tiled surface through the CPU at all). See
       [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
-      external to the repo) for the exact host-prerequisite checklist.
+      external to the repo) for the host-prerequisite checklist this session re-applied after a
+      clean reboot.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution.
 

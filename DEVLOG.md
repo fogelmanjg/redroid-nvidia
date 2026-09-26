@@ -1795,3 +1795,138 @@ uncontaminated *before* picture it needs to improve on. Full host-prerequisite c
 `jgustavo48` (all four kernel-module fixes above, in the order they actually bite, plus the exact
 `libdrm.so`/`vulkan.virtio.so` deployment gap) written up as a standalone reference doc, kept
 outside this repo since it's host-specific operational knowledge rather than project code.
+
+## 2026-09-26 — Real deployment, part 2: `c2.hardware.encoder.h264` actually visible to a real app for the first time, and the next wall is exactly where redroid-hwenc's own history said it would be
+
+Picked up immediately where the previous session left off: deploy the already-built NVENC Codec2
+service into a running container and see how far it gets. Before touching anything, checked
+`redroid-hwenc`'s own `DEVLOG.md`/`README.md` first, since it already solved this *exact* class of
+problem for VA-API and shares this same AOSP checkout - genuinely load-bearing: it corrected a wrong
+assumption sitting in this project's own `patches/codec2/README.md` ("needs the stock default
+Codec2 service disabled/replaced first"). **Not true.** redroid-hwenc's real, working deployment
+registers its store *alongside* the stock one - the stock service on this build is
+`IComponentStore/software` (legacy HIDL-backed), not `/default` at all, so a new AIDL store named
+`/default` never collides with it. Saved real time by reading their four already-diagnosed bugs
+before hitting them blind:
+
+1. Instance name must match the Framework Compatibility Matrix pattern `default[0-9]*` or
+   `vendor[0-9]*_software` - `getName()`/manifest `<fqname>` must literally be `default`. Already
+   correct in this project's code from the start (the comment explaining why was already there).
+2. `debug.stagefright.ccodec` must be `4`, which only happens via `redroid.c2.sh`, gated on
+   `ro.boot.use_redroid_c2=1` *and* `/dev/dma_heap/system` or `/dev/ion` existing. Fixed by adding
+   `androidboot.use_redroid_c2=1` to the container's `/init` cmdline args (redroid's `docker run`
+   `CMD` is literally `/init`'s own argv - confirmed via `docker inspect`, no redroid-specific env
+   mechanism involved).
+3. Needs a `media_codecs.xml` entry (`<MediaCodec name="c2.hardware.encoder.h264" .../>`) or
+   `Codec2InfoBuilder` silently drops the component before `MediaCodecList` ever sees it. **Already
+   present** in `hardware/redroid/omx/media_codecs.xml` - redroid-hwenc added this exact line for
+   the exact same component *name* (`c2.hardware.encoder.h264`, shared by both projects' components
+   since both target the same conceptual "the" hardware encoder slot), so no new edit needed here.
+4. A `C2StreamProfileLevelInfo` param must be declared or `addSupportedProfileLevels()` drops the
+   component before `MediaCodecList` sees it. Already present too (copied from `VaapiEncComponent`
+   at a point where it already had this fix).
+
+So, encouragingly, none of the four *code-level* traps applied - all already handled by having
+adapted from a component that had already hit them. What was still missing was purely deployment:
+
+**Restarted the container with `androidboot.use_redroid_c2=1` added**, confirmed
+`debug.stagefright.ccodec=4` took effect, then `docker cp`'d the service binary/`.rc`/manifest/
+seccomp policy in and `docker restart`'d so init would parse the new `.rc` and VINTF manifest
+fragment fresh. **First real bug**: `CANNOT LINK EXECUTABLE ... library "libcodec2.so" not found`.
+The AOSP build *does* produce a vendor-side copy (`vendor/lib64/libcodec2.so`) separate from the
+`/system/lib64/libcodec2.so` the container already had - vendor-namespace processes can't reach
+across into `/system/lib64/` the same way the earlier session's `vulkan.virtio.so`/`libdrm.so` gap
+worked, so a vendor binary needs its *own* copy of every non-VNDK-core dependency. Rather than
+chase the next missing library one crash at a time again, resolved the **full transitive closure**
+up front this time: wrote a small script that recursively parses each `.so`'s `DT_NEEDED` entries
+via `readelf -d` and walks the dependency graph against `vendor/lib64/`'s own build output,
+collecting every library actually needed. Produced 45 libraries in one pass (`libcodec2_hal_common`,
+`libcodec2_vndk`, `android.hardware.media.c2-V1-ndk`, `libcodec2_aidl`, the whole
+`android.hardware.graphics.*` HIDL/AIDL family, `libfmq`, `libhidlbase`, `libminijail`, etc.) -
+tarred them up and deployed all at once, instead of the slow one-crash-per-fix loop every earlier
+session in this project used. **This is worth doing first, every time, from now on**: `readelf -d
+<binary> | grep NEEDED` plus one recursive pass against the build output is strictly better than
+iterating on linker crashes.
+
+With the full closure deployed, the service actually started and logged the load-bearing line:
+`servicemanager: Found android.hardware.media.c2.IComponentStore/default in device VINTF manifest`,
+and `dumpsys android.hardware.media.c2.IComponentStore/default` correctly listed
+`c2.hardware.encoder.h264` (rank 1). **The service is a lazy HAL** (doesn't stay resident with no
+client bound - `pgrep` finding nothing between calls is expected, not a crash, confirmed by the
+registration succeeding and later working end to end).
+
+**Second real bug, same shape as redroid-hwenc's own bug #4**: `scrcpy --list-encoders` still
+didn't show it - `Codec2Client: Available Codec2 services: "software"` only, `default` never even
+queried. `mediaserver` builds its codec list once, lazily, on first request, and caches it for its
+whole process lifetime - since this exact boot had the service crash-looping on missing libraries
+for its first ~20 seconds, mediaserver's first query almost certainly happened during that window.
+`kill -9`'ing `mediaserver` (letting `init` restart it fresh) is the documented fix - tried it
+alone first and it *wasn't* sufficient this time, still only `"software"`. The actual second
+factor: `media.c2.hal.selection=aidl` / `cmd device_config put codec_fwk aidl_hal true` (both unset
+by default on this build) gate whether `Codec2Client::GetServiceNames()` even attempts the AIDL
+`default` store at all, not just which one wins - setting both, then killing `mediaserver` again,
+changed the log line to `Available Codec2 services: "default" "software"` (both now queried).
+**Setting only this flag without the entry from the next paragraph in place first caused a total
+regression** (zero video encoders at all, not just ours missing) - a real, confusing red herring
+worth flagging: it's not that this flag broke anything by itself, it's that it exposed the *next*
+bug in a way that aborted `Codec2InfoBuilder`'s entire list-building pass instead of just skipping
+our component.
+
+**Third real bug, found via the actual `Codec2InfoBuilder` log line rather than guessing**:
+`component 'c2.hardware.encoder.h264' not found in xml`. The *deployed* `/vendor/etc/media_codecs.xml`
+inside this specific container image predates the line redroid-hwenc added to the source tree - the
+running image was built before that edit landed, so despite the source-of-truth file being correct,
+the actual file on disk wasn't. `diff`ed the source against the deployed copy to confirm the *only*
+difference was the missing `<MediaCodec>` line (not a stale/incompatible file otherwise), then
+deployed the source file wholesale. With that plus the AIDL flags plus another `mediaserver`
+restart: **`c2.hardware.encoder.h264 (hw) [vendor]` appeared in `scrcpy --list-encoders` for the
+first time in this project's history** - the same milestone line redroid-hwenc's own DEVLOG recorded
+for VA-API, now true for NVENC too.
+
+**Pointed scrcpy at it for real** (`--video-encoder=c2.hardware.encoder.h264`, headless via
+`SDL_VIDEODRIVER=dummy --no-playback --record=...`, since this session runs over SSH with no real
+display - `scrcpy --no-playback` alone still tries to open a window without it). Got the same
+generic `IllegalStateException: Pending dequeue output buffer request cancelled` scrcpy always
+throws when the underlying encoder errors internally (redroid-hwenc's own DEVLOG hit the identical
+exception text for an entirely different underlying cause - `radeonsi: VCN - DCC surfaces not
+supported` - so this exception text alone is not diagnostic, only the symptom that *something*
+failed inside the encoder). The real cause, from this component's own logcat tag:
+`NvencEncComponent: input handle isn't a cros_gralloc_handle (numFds=1 numInts=46)` - i.e. exactly
+the open question `patches/codec2/README.md` already flagged as unconfirmed ("whether a real
+Surface-sourced encoder input buffer really does arrive as a `cros_gralloc_handle_t` in practice"),
+now answered for real: **it doesn't**. A genuine `cros_gralloc_handle_t` needs exactly 36 ints of
+payload after the `native_handle_t` header (computed directly from the struct's own field layout);
+the real buffer arrives with 47 (1 fd + 46 ints) - a completely different, larger structure, not a
+truncated or version-skewed cros_gralloc handle. This is the *same* discovery redroid-hwenc's own
+`VaapiEncComponent` already made on AMD/Intel (its own header has a comment about exactly this),
+just never yet confirmed on this project's own NVIDIA/cros_gralloc stack until now.
+
+Added temporary diagnostic logging (dumping every raw fd/int in the unrecognized handle as hex),
+rebuilt just the two affected modules (`m libnvenc_codec2_component && m
+android.hardware.media.c2-nvenc-service`, ~17s each thanks to Soong's incremental build, no full
+image rebuild needed for a `docker cp`-based deploy), redeployed, and re-triggered a real capture.
+**Real data captured**: `fds=[10]`, and, at consistent integer offsets across two separate capture
+attempts, values that decode cleanly against known facts about this exact device - `0x2d0`/`0x500`
+(720/1280, the display's real dimensions) and `0x34324241` (the ASCII bytes `AB24`, DRM's fourcc
+for `ABGR8888`) both appearing at fixed offsets, plus a stride-shaped value (`0xc00` = 3072 bytes,
+matching Tier 5's own already-confirmed `3072`-byte stride for this exact 720-wide buffer) at
+another fixed offset. Not yet identified *which* Android-internal wrapper type this actually is
+(searched this project's own AOSP tree for the handle's own apparent magic constant, `0xabcddcba` -
+no match, meaning it's very likely produced by a prebuilt component this tree doesn't have source
+for, not something this project's own patches touch). Ruled out one easy explanation before writing
+this up: `DRM_IOCTL_VIRTGPU_RESOURCE_INFO` (already used elsewhere in this same component to resolve
+the Venus `res_id`) can't supply width/height/stride/format instead of parsing this handle - its
+kernel struct (`drm_virtgpu_resource_info`) only carries `bo_handle`/`res_handle`/`size`/`blob_mem`,
+confirmed by reading the actual kernel header, not assumed.
+
+**Where this leaves Tier 7**: `c2.hardware.encoder.h264` is now real, registered, and discoverable
+by genuine framework clients exactly like redroid-hwenc's own hardware encoder is - the entire
+service-registration half of this tier, previously all theory and build-level confirmation, is now
+live and confirmed on real hardware. What's left is the identical *shape* of problem redroid-hwenc's
+own Tier 5.6-5.7 had to solve next: decode the real Surface-sourced buffer's actual layout (this
+session captured real, consistent raw bytes to work from - the next session's job is turning that
+into a second, fallback parsing path in `NvencEncComponent::process()`, exactly mirroring how
+`VaapiEncComponent` itself grew a non-cros_gralloc fallback path for its own equivalent discovery),
+then get an actual encoded frame out the other end. The diagnostic logging added this session should
+stay in the component (behind the existing `ALOGE` calls, not gated further) since it's cheap and
+was directly load-bearing for this exact investigation.
