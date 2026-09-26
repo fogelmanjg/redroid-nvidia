@@ -258,7 +258,7 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
          * fundamentally cannot name it, no matter how correctly it's parsed.
          * Fall back to the SCM_RIGHTS transport instead. */
         ret = vtest_encode_via_scm(dmabufFd, width, height, drmFormat, stride, formatModifier,
-                                    &coded, &codedSize);
+                                    /*forceIdr=*/!mCsdSent, &coded, &codedSize);
         if (ret) ALOGE("vtest_encode_via_scm failed: %d", ret);
     }
     if (ret) {

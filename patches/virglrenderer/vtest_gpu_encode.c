@@ -648,6 +648,15 @@ vtest_gpu_encode_discover_modifier(uint32_t drm_format)
    return chosen;
 }
 
+void
+vtest_gpu_encode_force_idr(void)
+{
+   pthread_mutex_lock(&enc_mutex);
+   enc.cur_w = 0;
+   enc.cur_h = 0;
+   pthread_mutex_unlock(&enc_mutex);
+}
+
 int
 vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
                         uint32_t drm_format, uint64_t modifier,

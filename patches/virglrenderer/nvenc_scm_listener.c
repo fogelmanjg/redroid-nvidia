@@ -74,6 +74,9 @@ handle_connection(int conn_fd)
    if (!modifier)
       modifier = vtest_gpu_encode_discover_modifier(req.drm_format);
 
+   if (req.force_idr)
+      vtest_gpu_encode_force_idr();
+
    const uint8_t *coded = NULL;
    uint32_t coded_len = 0;
    /* vtest_gpu_encode_dmabuf() consumes fd either way. */

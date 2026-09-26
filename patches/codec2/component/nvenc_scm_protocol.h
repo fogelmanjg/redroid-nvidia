@@ -42,6 +42,14 @@
 
 #include <stdint.h>
 
+/*
+ * This path is only meaningful from the guest's point of view - /dev/venus
+ * is the container's own bind-mount of the host's venus-sock directory (the
+ * same one venus.sock itself lives in). The host-side listener
+ * (nvenc_scm_listener.c) does not use this constant at all: it runs on the
+ * real host, where /dev/venus doesn't exist, and instead derives its own
+ * bind path from the real venus.sock path it was started with.
+ */
 #define NVENC_SCM_SOCKET_PATH "/dev/venus/nvenc-scm.sock"
 
 typedef struct {
@@ -54,6 +62,15 @@ typedef struct {
                              * the real modifier for this format/driver
                              * itself in that case rather than trust a
                              * guessed value (see vtest_gpu_encode.c). */
+    /* The persistent host-side encoder session (vtest_gpu_encode.c) only
+     * re-initializes NVENC - where repeatSPSPPS lives - on a *resolution*
+     * change, never on a genuinely new streaming session at the same
+     * resolution (confirmed the hard way: a second, unrelated client
+     * connecting at the same size silently continued the first client's
+     * session, emitting P-frames with no SPS/PPS instead of a fresh IDR).
+     * Set to 1 on a sender's own first call to force a fresh
+     * IDR+SPS/PPS regardless of whether the resolution actually changed. */
+    uint32_t force_idr;
 } EncodeRequest;
 
 typedef struct {

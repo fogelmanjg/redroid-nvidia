@@ -45,4 +45,15 @@ int vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
  */
 uint64_t vtest_gpu_encode_discover_modifier(uint32_t drm_format);
 
+/*
+ * Forces the next vtest_gpu_encode_dmabuf() call to re-initialize NVENC
+ * (where repeatSPSPPS lives) even if the resolution hasn't changed from the
+ * previous call - the persistent session's own reconfigure check only
+ * fires on a genuine resolution change otherwise, silently continuing a
+ * prior, unrelated client's session (P-frames, no SPS/PPS) for a brand new
+ * one at the same size. Callers should invoke this once per new streaming
+ * session, before their own first encode call.
+ */
+void vtest_gpu_encode_force_idr(void);
+
 #endif /* VTEST_GPU_ENCODE_H */

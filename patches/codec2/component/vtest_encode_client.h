@@ -25,6 +25,7 @@
 #ifndef NVENC_CODEC2_VTEST_ENCODE_CLIENT_H
 #define NVENC_CODEC2_VTEST_ENCODE_CLIENT_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -81,11 +82,17 @@ int vtest_encode_resource(uint32_t res_id, uint32_t width, uint32_t height,
  *     native_handle_t this project's own NvencEncComponent falls back to
  *     parsing) - the host re-derives the real modifier for this format
  *     itself in that case rather than trust a guessed value.
+ * forceIdr: pass true on this component instance's own first call. The
+ *     host's persistent encoder session only re-initializes NVENC (where
+ *     repeatSPSPPS lives) on a resolution change, never on a genuinely new
+ *     streaming session at the same resolution - without this, a second,
+ *     unrelated client connecting at the same size silently continues the
+ *     first client's session (P-frames, no SPS/PPS) instead of a fresh IDR.
  *
  * Returns 0 on success, or a negative errno.
  */
 int vtest_encode_via_scm(int dmabuf_fd, uint32_t width, uint32_t height, uint32_t drm_format,
-                         uint32_t stride, uint64_t modifier, uint8_t **out_buf,
+                         uint32_t stride, uint64_t modifier, bool forceIdr, uint8_t **out_buf,
                          uint32_t *out_len);
 
 #ifdef __cplusplus

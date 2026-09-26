@@ -94,9 +94,28 @@ uint32_t vtest_encode_resolve_res_id(int render_node_fd, int dmabuf_fd) {
 
     struct drm_virtgpu_resource_info info = {};
     info.bo_handle = prime_handle.handle;
-    if (drmIoctl(render_node_fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &info)) {
+    int ioctl_ret = drmIoctl(render_node_fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &info);
+    int ioctl_errno = errno;
+
+    // renderNodeFd() keeps one fd open for this component's entire lifetime,
+    // so every call here was leaking a local GEM handle into that fd's own
+    // handle table (PRIME_FD_TO_HANDLE opens a new one every time; nothing
+    // ever released it) - confirmed the hard way: a completely unrelated
+    // buffer (a 108x108 UI overlay, nothing to do with this component)
+    // later hit `DRM_IOCTL_GEM_CLOSE failed (handle=1) error -1` right
+    // before SurfaceFlinger's RenderEngine aborted, matching this exact
+    // leaked handle number. Close it immediately - nothing past this point
+    // needs the local handle, only the resource id already read from it.
+    struct drm_gem_close close_req = {};
+    close_req.handle = prime_handle.handle;
+    if (drmIoctl(render_node_fd, DRM_IOCTL_GEM_CLOSE, &close_req)) {
+        ALOGE("DRM_IOCTL_GEM_CLOSE failed for handle=%u: %s", prime_handle.handle,
+              strerror(errno));
+    }
+
+    if (ioctl_ret) {
         ALOGE("DRM_IOCTL_VIRTGPU_RESOURCE_INFO failed: %s (dmabuf_fd=%d bo_handle=%u)",
-              strerror(errno), dmabuf_fd, prime_handle.handle);
+              strerror(ioctl_errno), dmabuf_fd, prime_handle.handle);
         return 0;
     }
     ALOGE("DRM_IOCTL_VIRTGPU_RESOURCE_INFO ok: bo_handle=%u res_handle=%u size=%u blob_mem=%u",
@@ -163,7 +182,7 @@ int vtest_encode_resource(uint32_t res_id, uint32_t width, uint32_t height,
 }
 
 int vtest_encode_via_scm(int dmabuf_fd, uint32_t width, uint32_t height, uint32_t drm_format,
-                         uint32_t stride, uint64_t modifier, uint8_t **out_buf,
+                         uint32_t stride, uint64_t modifier, bool forceIdr, uint8_t **out_buf,
                          uint32_t *out_len) {
     /* dmabuf_fd is borrowed from the caller's C2Handle/native_handle_t, same
      * as vtest_encode_resource()'s own res-id-resolution step above - never
@@ -191,6 +210,7 @@ int vtest_encode_via_scm(int dmabuf_fd, uint32_t width, uint32_t height, uint32_
     req.drm_format = drm_format;
     req.stride = stride;
     req.modifier = modifier;
+    req.force_idr = forceIdr ? 1 : 0;
 
     char cmsg_buf[CMSG_SPACE(sizeof(int))];
     struct iovec iov = {.iov_base = &req, .iov_len = sizeof(req)};

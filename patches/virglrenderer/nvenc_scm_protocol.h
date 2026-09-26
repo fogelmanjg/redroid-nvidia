@@ -62,6 +62,15 @@ typedef struct {
                              * the real modifier for this format/driver
                              * itself in that case rather than trust a
                              * guessed value (see vtest_gpu_encode.c). */
+    /* The persistent host-side encoder session (vtest_gpu_encode.c) only
+     * re-initializes NVENC - where repeatSPSPPS lives - on a *resolution*
+     * change, never on a genuinely new streaming session at the same
+     * resolution (confirmed the hard way: a second, unrelated client
+     * connecting at the same size silently continued the first client's
+     * session, emitting P-frames with no SPS/PPS instead of a fresh IDR).
+     * Set to 1 on a sender's own first call to force a fresh
+     * IDR+SPS/PPS regardless of whether the resolution actually changed. */
+    uint32_t force_idr;
 } EncodeRequest;
 
 typedef struct {
