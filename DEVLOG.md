@@ -2249,3 +2249,92 @@ hardware path itself still crashes intermittently and the picture is still black
 whichever of their internal asserts is the one actually firing - not yet pinned down to a single
 line) specifically for a `HW_VIDEO_ENCODER`-usage buffer's format-properties query, to find what's
 actually different about this call versus the many confirmed-working ones from Tier 4.
+
+## 2026-09-26 (same day, continued yet further, from a second machine over Tailscale) — A real regression in this project's own modified `virgl_test_server`, found and fixed by going back to first principles, and the actual remaining bug finally isolated in the clear
+
+Resumed with the user connecting from a different machine (`jgustavo46`) over Tailscale, through a
+`socat` port-forward to the container's Docker-bridge address (no code changes needed for this,
+just host networking - `TCP-LISTEN:15555,fork,reuseaddr` forwarding to the container's `172.17.0.2:5555`).
+
+**A real architectural question, worth its own detour.** The user asked directly: shouldn't AMD/
+Intel and NVIDIA ideally share one redroid image, with vendor differences handled entirely on the
+host? Answered honestly rather than assume it was already true: redroid-hwenc never needed Venus at
+all (AMD/Intel's own Mesa drivers run natively in the bionic guest), while this project needed it
+unconditionally (NVIDIA's proprietary driver can't be ported to bionic) - so today, the two
+projects' encode components are structurally similar (grab a dma-buf fd, hand it to a host-side
+process, get bytes back) but not literally shared code. Confirmed this is a real, achievable future
+goal, not yet attempted - noted in the main README.
+
+**Software encoder, tested for the first time this session against a genuine live (not headless)
+connection, immediately surfaced two more real, load-bearing bugs.** Both traced with the same
+"check the real evidence, don't guess" discipline as everything else today:
+
+1. **A crash tied to live mirroring, not to the encoder at all.** Live connections crashed
+   `SurfaceFlinger` almost immediately (identical `SIGABRT` signature to every earlier "hardware
+   encoder" crash); a plain `--record` session on the exact same container, same duration, never
+   did. Tested directly rather than assumed: `--no-control` on a live connection stopped the crash
+   entirely. This means the whole day's "hardware encoder crashes SurfaceFlinger" framing was
+   *wrong* - the trigger is scrcpy's control channel (very likely the pointer/cursor icon surface
+   Android sets up once a real `InputManager` connection exists), completely independent of which
+   video encoder is in use. Not yet fixed, but now correctly scoped as a general live-mirroring
+   issue, not an NVENC-specific one.
+2. **A silent regression in this project's own modified `virgl_test_server` that broke *normal*
+   rendering entirely** - discovered because, even with `--no-control` avoiding the crash, the
+   screen came back solid white (not black, not the software encoder's own known corruption -
+   genuinely blank) on every container tested, including brand-new ones. `screencap` itself started
+   hanging outright at one point, traced via `debuggerd -b` to `RenderEngine`/`SurfaceFlinger`
+   sitting completely idle (`condition_variable::wait`, no pending work at all) while `screencap`'s
+   own thread blocked forever on a `std::future` that would never be fulfilled - not a Venus/Mesa
+   assert this time, a request that never even reached RenderEngine. Also found, along the way, six
+   orphaned `virgl_render_server` child processes accumulated from the day's many crash-and-restart
+   cycles (each holding real host memory, likely real GPU-side Vulkan context state too) - killed
+   them, which helped the *hang* specifically but not the white screen.
+   **Isolated the real cause with a clean A/B test**: swapped back to the untouched, pristine
+   `virgl_test_server` binary (the one waydroid-nvidia's own release ships, kept as a backup since
+   session one) - real content, every time, on multiple fresh containers. Swapped back to this
+   project's own modified binary (with `VCMD_ENCODE_RESOURCE` support) - white, every time. **This
+   project's own build of `virgl_test_server` has a real regression**, unrelated to anything in
+   today's earlier fixes.
+
+   First hypothesis, plausible but wrong: the new `nvenc_scm_listener` pthread (added two sessions
+   ago, running for the process's entire lifetime) combined with `virgl_test_server`'s own internal
+   `fork()` (used once per Venus context, to spawn its `virgl_render_server` child) - a textbook
+   hazard, since a thread holding any libc-internal lock (malloc's arena lock, the dynamic linker's
+   own lock from a `dlopen()`) at the exact moment another part of the process calls `fork()` leaves
+   that lock permanently held in the child, deadlocking any later call that needs it (essentially
+   any `malloc()`). Removed the pthread entirely, moved the SCM_RIGHTS listener to a genuinely
+   separate process instead (`patches/nvenc-daemon/nvenc_scm_daemon.c`, a small standalone `gcc`-built
+   binary reusing `vtest_gpu_encode.c` unchanged, its own `main()`, no shared address space with
+   `virgl_test_server` at all - this also happens to structurally match redroid-hwenc's own VA-API
+   daemon, directly relevant to the architecture question above). **Rebuilt, retested - still
+   white.** The pthread was a real, worth-keeping architectural fix (removes a genuine hazard
+   class), but it was not the cause of *this* regression. Checked for a shared-library ABI mismatch
+   next (a stale `libvirglrenderer.so.1` next to a rebuilt `virgl_test_server`) - ruled out directly,
+   `md5sum` confirmed the deployed library is byte-for-byte the one this project's own rebuild
+   produces. Checked the new wire-protocol command ID (`VCMD_ENCODE_RESOURCE = 45`) for a collision
+   with anything existing - none found, 45 is genuinely the next free number after 44. **Root cause
+   not yet pinned to a specific line** - deferred rather than chased further tonight, since a clean,
+   practical workaround exists and unblocks everything else.
+
+   **The practical fix, available specifically because the SCM daemon is now a separate process**:
+   run the *pristine*, confirmed-correct `virgl_test_server` for real Venus/rendering traffic,
+   alongside the new *standalone* `nvenc_scm_daemon` for encoding - since a real
+   `GraphicBufferSource` capture buffer was already confirmed (previous session) to always resolve
+   via `SCM_RIGHTS`, never `VCMD_ENCODE_RESOURCE`, this combination loses nothing for the actual use
+   case while completely avoiding whatever regression lives in this project's own modified
+   `virgl_test_server`. Confirmed working: `screencap` renders real content again (search bar, all
+   icons, the wallpaper - with the already-known, separately-tracked Tier 5 dashed-line corruption,
+   nothing new), and a real NVENC encode through the standalone daemon still produces a complete,
+   valid, `probe_score=100` MP4 with zero crashes.
+
+**With the rendering-breaking regression out of the picture, the actual remaining NVENC content bug
+is finally visible on its own, and it's exactly what the stride/modifier hypothesis predicted** -
+not solid black anymore (that was very likely this same regression compounding with the real bug,
+producing a strictly-worse combined symptom), but genuine, recognizable, *structured* corruption:
+a real status bar and layout visible, with the same checkerboard-block pattern this project's own
+Tier 5 investigation already extensively characterized as the signature of reading GPU-tiled
+memory as if it were plain linear. This is real, concrete progress - the previous "totally opaque,
+uniformly black" symptom is gone, replaced by a symptom this project already has a full diagnostic
+playbook for. **Next session**: apply Tier 5's own untiling-readback approach (or a correctly
+paired stride/modifier, now that a clean baseline exists to test against) to this specific
+SCM_RIGHTS-sourced buffer.

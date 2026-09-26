@@ -81,19 +81,17 @@ no Android/redroid involved — see [`../../tests/tier7_vcmd_encode_resource_tes
   Add both to `vtest_sources` in `vtest/meson.build`. Needs FFmpeg's `nv-codec-headers` installed
   to `/usr/local/include` (`git clone https://github.com/FFmpeg/nv-codec-headers && cd $_ && sudo
   make install`) for `<ffnvcodec/nvEncodeAPI.h>` — same as [`../../tests/tier7_nvenc_dualexport_spike.c`](../../tests/tier7_nvenc_dualexport_spike.c).
-- [`nvenc_scm_listener.c`](nvenc_scm_listener.c) / [`.h`](nvenc_scm_listener.h) /
-  [`nvenc_scm_protocol.h`](nvenc_scm_protocol.h) — a second, independent transport for encoding a
-  plain (non-Venus) dma-buf, for exactly the case `VCMD_ENCODE_RESOURCE` fundamentally can't reach:
-  a real Surface-sourced capture buffer that was never allocated through this project's own Venus
-  path (confirmed 2026-09-26, see DEVLOG). Runs as its own detached thread, started once from
-  `vtest_main`'s entry point (see the `vtest_server.c` modification below) — calls straight into
-  the *same* `vtest_gpu_encode_dmabuf()` above, just reached via `SCM_RIGHTS` fd-passing instead of
-  a Venus resource id, mirroring redroid-hwenc's own VA-API daemon exactly (valid here because
-  redroid shares one real kernel between guest and host). Add all three to `vtest_sources`.
-  [`vtest_server.c`](vtest_server.c) is vendored in full here too (unlike everything else in this
-  section) since this is the first change this project has ever needed to make to it — two lines
-  only: `#include "nvenc_scm_listener.h"` and one `vtest_nvenc_scm_listener_start(server.socket_name)`
-  call right before `vtest_server_run()`.
+- `nvenc_scm_protocol.h` — the wire format for a second, independent transport for encoding a plain
+  (non-Venus) dma-buf, for exactly the case `VCMD_ENCODE_RESOURCE` fundamentally can't reach: a real
+  Surface-sourced capture buffer that was never allocated through this project's own Venus path
+  (confirmed 2026-09-25, see DEVLOG). **Not implemented inside `virgl_test_server` itself** — an
+  earlier version lived here as a `pthread_create()`-started listener thread, but that combination
+  (a long-lived background thread in a process that also `fork()`s internally, once per Venus
+  context, to spawn its own `virgl_render_server`) turned out to cause a real, confirmed regression
+  in ordinary rendering, unrelated to anything encode-specific (see DEVLOG's 2026-09-26 entry for
+  the full A/B-tested diagnosis). Moved to [`../nvenc-daemon/`](../nvenc-daemon/) as a genuinely
+  separate, standalone process instead — `vtest_server.c` itself is back to completely
+  unmodified/pristine, no changes needed here at all for this transport.
 
 ### Modifications to existing files (small, prose-documented like `VCMD_RESOURCE_ALLOC_GPU` above rather than checked in as a diff)
 

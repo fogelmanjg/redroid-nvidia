@@ -644,10 +644,37 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
 
       **Net effect of this session**: connecting is now far more resilient (no restart
       choreography, both encoders freely selectable) even though the hardware path still crashes
-      intermittently and the picture is still black when it doesn't. Next step: instrument
-      `vn_ring_cs_upload_locked`/`vn_ring_submission_prepare` for a `HW_VIDEO_ENCODER`-usage
-      buffer's format-properties query specifically, to pin down which assert fires and why this
-      call differs from Tier 4's own confirmed-working ones.
+      intermittently and the picture is still black when it doesn't.
+
+      **Continued from a second machine, over Tailscale — the crash reframed correctly, a real
+      regression in this project's own `virgl_test_server` found and fixed, and the actual content
+      bug finally visible in the clear.** Tested directly rather than kept assuming: `--no-control`
+      on a *live* (not `--record`) connection stopped the SurfaceFlinger crash entirely — the
+      trigger was scrcpy's control channel (very likely the pointer/cursor surface Android sets up
+      once a real `InputManager` connection exists), not the video encoder at all; every earlier
+      "hardware encoder crashes it" session was watching the same crash from the wrong angle. With
+      the crash out of the way, the screen came back solid **white** — not the software encoder's
+      already-known corruption, not this session's earlier black, genuinely blank, on every
+      container tested. A clean A/B test (this project's own modified `virgl_test_server` vs. the
+      untouched, pristine binary waydroid-nvidia ships) isolated a real regression in this project's
+      own build, unrelated to anything in today's earlier fixes. First hypothesis — the
+      `nvenc_scm_listener` pthread (added two sessions ago) combined with `virgl_test_server`'s own
+      internal `fork()` (once per Venus context, to spawn `virgl_render_server`), a textbook hazard
+      since a thread holding any libc-internal lock at the moment of `fork()` leaves it permanently
+      held in the child — was a real, worth-keeping fix (moved the listener to a genuinely separate
+      process, [`patches/nvenc-daemon/`](patches/nvenc-daemon/), matching redroid-hwenc's own VA-API
+      daemon shape exactly) but **not the actual cause of the white screen** — confirmed still
+      white afterward. Root cause not yet pinned to a specific line (ruled out a shared-library ABI
+      mismatch and a wire-protocol command-ID collision directly, not by assumption); deferred in
+      favor of the practical fix now available specifically because the daemon is a separate
+      process: run the confirmed-correct *pristine* `virgl_test_server` for real rendering, alongside
+      the new *standalone* `nvenc_scm_daemon` for encoding. **With the rendering regression out of
+      the picture, the actual remaining NVENC content bug is finally visible on its own** — not
+      solid black anymore (very likely this same regression compounding with the real bug into a
+      strictly worse combined symptom), but genuine, structured corruption matching Tier 5's own
+      already-characterized checkerboard-block signature for reading GPU-tiled memory as linear.
+      Real progress: a fully opaque symptom replaced by one this project already has a diagnostic
+      playbook for.
 
       See DEVLOG's 2026-09-26 entries for the full detail, and
       [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
