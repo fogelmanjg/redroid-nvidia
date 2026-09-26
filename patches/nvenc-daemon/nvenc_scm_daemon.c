@@ -86,9 +86,22 @@ handle_connection(int conn_fd)
       return;
    }
 
+   /*
+    * Real, load-bearing finding (2026-09-26): a real GraphicBufferSource
+    * capture buffer on this stack genuinely IS DRM_FORMAT_MOD_LINEAR (0) -
+    * confirmed by mmap()-ing the raw dma-buf directly and rendering it as
+    * plain linear RGBA: the actual home screen (search bar, wallpaper,
+    * icons, nav bar) came out fully recognizable, at the exact
+    * stride-derived width, with zero tiling artifacts. The wrapper this
+    * project's guest-side component parses has no identifiable modifier
+    * field and correctly reports 0/unknown - previously "helped" here by
+    * guessing a real, but WRONG, non-linear block-linear modifier via
+    * vtest_gpu_encode_discover_modifier() whenever modifier was 0. That
+    * guess is what produced every "recognizable but corrupted" result this
+    * investigation chased for hours: a genuinely linear buffer, imported
+    * and copied as if block-linear-tiled. Trust the sender's 0 as a real
+    * answer, not a request to guess. */
    uint64_t modifier = req.modifier;
-   if (!modifier)
-      modifier = vtest_gpu_encode_discover_modifier(req.drm_format);
 
    if (req.force_idr)
       vtest_gpu_encode_force_idr();

@@ -38,12 +38,19 @@ int vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
                             uint32_t *out_len);
 
 /*
- * Asks the driver for its own real modifier for a DRM format - used by the
- * SCM_RIGHTS listener (nvenc_scm_listener.c) for buffers whose sender has
- * no reliable modifier of its own to report. Returns 0
- * (DRM_FORMAT_MOD_LINEAR) if nothing better is found.
+ * Asks the driver for its own real modifier for a DRM format at a specific
+ * width/height - used by the SCM_RIGHTS daemon for buffers whose sender has
+ * no reliable modifier of its own to report. Width/height matter: this
+ * driver exposes several real non-linear candidates per format, differing
+ * only in NVIDIA's own block-height tiling parameter, and the driver's
+ * choice among them depends on the image's actual dimensions - so this
+ * creates a throwaway image at the real size and reads back the modifier
+ * the driver actually assigned, rather than guessing from the raw
+ * candidate list. Returns 0 (DRM_FORMAT_MOD_LINEAR) if nothing better is
+ * found.
  */
-uint64_t vtest_gpu_encode_discover_modifier(uint32_t drm_format);
+uint64_t vtest_gpu_encode_discover_modifier(uint32_t drm_format, uint32_t width,
+                                            uint32_t height);
 
 /*
  * Forces the next vtest_gpu_encode_dmabuf() call to re-initialize NVENC

@@ -84,6 +84,7 @@ struct encode_state {
    PFN_vkCreateImage CreateImage;
    PFN_vkDestroyImage DestroyImage;
    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+   PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
    PFN_vkAllocateMemory AllocateMemory;
    PFN_vkFreeMemory FreeMemory;
    PFN_vkBindImageMemory BindImageMemory;
@@ -154,6 +155,17 @@ drm_format_to_vk(uint32_t drm_format)
    case 0x30334241: return VK_FORMAT_A2B10G10R10_UNORM_PACK32; /* AB30 */
    case 0x48344241: return VK_FORMAT_R16G16B16A16_SFLOAT;  /* AB4H */
    default: return VK_FORMAT_UNDEFINED;
+   }
+}
+
+static uint32_t
+drm_format_bpp(uint32_t drm_format)
+{
+   switch (drm_format) {
+   case 0x20203852: return 1;               /* R8   */
+   case 0x36314752: return 2;               /* RG16 */
+   case 0x48344241: return 8;               /* AB4H */
+   default: return 4;                       /* AR24/XR24/AB24/XB24/AB30 */
    }
 }
 
@@ -255,6 +267,7 @@ encode_vk_init_locked(void)
    GET_DEV(CreateImage);
    GET_DEV(DestroyImage);
    GET_DEV(GetImageMemoryRequirements);
+   GET_DEV(GetImageSubresourceLayout);
    GET_DEV(AllocateMemory);
    GET_DEV(FreeMemory);
    GET_DEV(BindImageMemory);
@@ -581,44 +594,52 @@ encode_reconfigure_locked(uint32_t width, uint32_t height, uint64_t modifier,
 }
 
 /*
- * Discovers the driver's own real modifier for a format, the same way
- * vtest_gpu_alloc.c's own allocator does when it first creates a buffer
- * (enumerate what the format supports, non-linear, single-plane,
- * renderable+samplable) - used for the SCM_RIGHTS path (see
- * nvenc_scm_listener.c), where the sending side (a Codec2 component reading
- * an opaque, non-cros_gralloc native_handle_t it can't fully decode) has no
- * reliable way to report the buffer's true modifier itself. Matches
- * redroid-hwenc's own VA-API daemon philosophy exactly: let the host
- * determine its own real modifier by asking its own driver, rather than
- * trust a value the sender can't actually know. Deliberately does not
- * create an image to read back GetImageDrmFormatModifierPropertiesEXT's
- * "chosen" value the way the allocator does - in practice this driver
- * exposes exactly one non-linear candidate per format, so the first match
- * from the enumeration is that same answer without the extra round trip.
- * Returns 0 (DRM_FORMAT_MOD_LINEAR) if nothing better is found - not a
- * likely correct answer for a real composited surface, but a safe,
- * deterministic fallback that fails the subsequent import cleanly instead
- * of silently using a stale value from a previous call.
+ * Discovers the driver's own real modifier for a format AND a specific
+ * width/height - used for the SCM_RIGHTS path, where the sending side (a
+ * Codec2 component reading an opaque, non-cros_gralloc native_handle_t it
+ * can't fully decode) has no reliable way to report the buffer's true
+ * modifier itself. Matches redroid-hwenc's own VA-API daemon philosophy:
+ * let the host determine its own real modifier by asking its own driver,
+ * rather than trust a value the sender can't actually know.
+ *
+ * Real, load-bearing finding (2026-09-26): this driver exposes *six* real
+ * non-linear candidates per format on this GPU, not one - confirmed by
+ * dumping the actual enumeration rather than assuming. They differ only in
+ * NVIDIA's own low-nibble "block height" (GOB height) field of its public
+ * BLOCK_LINEAR_2D modifier encoding - a real tiling parameter the driver
+ * picks based on the image's actual height (shorter images get a smaller,
+ * more efficient block height; taller ones get a larger one). Blindly
+ * picking the first/largest candidate (this function's own earlier
+ * version) produces exactly the checkerboard-block misalignment this
+ * project's own Tier 5 investigation already characterized - not because
+ * the buffer isn't tiled or the wrong modifier *family* was chosen, but
+ * because the wrong *block height variant* was used to interpret bytes
+ * that were actually laid out with a different one.
+ *
+ * Fixed by actually creating a throwaway image at the real width/height
+ * with all real candidates offered via VkImageDrmFormatModifierListCreateInfoEXT
+ * (the same shape vtest_gpu_alloc.c's own allocator already uses) and
+ * reading back the modifier the driver *actually* assigned via
+ * GetImageDrmFormatModifierPropertiesEXT - this is the same choice the
+ * driver would make for a real allocation at this size, not a guess.
  */
-uint64_t
-vtest_gpu_encode_discover_modifier(uint32_t drm_format)
+static uint64_t
+discover_modifier_locked(VkFormat format, uint32_t width, uint32_t height,
+                         VkImageUsageFlags usage)
 {
-   const VkFormat format = drm_format_to_vk(drm_format);
-   if (format == VK_FORMAT_UNDEFINED)
+   if (format == VK_FORMAT_UNDEFINED || !width || !height)
       return 0;
 
-   pthread_mutex_lock(&enc_mutex);
    int ret = encode_init_locked();
-   if (ret) {
-      pthread_mutex_unlock(&enc_mutex);
+   if (ret)
       return 0;
-   }
 
 #define GET_INST(name) PFN_vk##name name = (PFN_vk##name)enc.GetInstanceProcAddr(enc.instance, "vk" #name)
    GET_INST(GetPhysicalDeviceFormatProperties2);
+   GET_INST(GetImageDrmFormatModifierPropertiesEXT);
 #undef GET_INST
    uint64_t chosen = 0;
-   if (GetPhysicalDeviceFormatProperties2) {
+   if (GetPhysicalDeviceFormatProperties2 && GetImageDrmFormatModifierPropertiesEXT) {
       VkDrmFormatModifierPropertiesListEXT mod_list = {
          .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
       };
@@ -635,15 +656,61 @@ vtest_gpu_encode_discover_modifier(uint32_t drm_format)
 
       const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
                                         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+      uint64_t candidates[64];
+      uint32_t num_candidates = 0;
       for (uint32_t i = 0; i < mod_list.drmFormatModifierCount; i++) {
          if (props[i].drmFormatModifierPlaneCount == 1 &&
              (props[i].drmFormatModifierTilingFeatures & need) == need &&
              props[i].drmFormatModifier != 0) {
-            chosen = props[i].drmFormatModifier;
-            break;
+            candidates[num_candidates++] = props[i].drmFormatModifier;
+         }
+      }
+
+      if (num_candidates > 0) {
+         const VkImageDrmFormatModifierListCreateInfoEXT mod_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+            .drmFormatModifierCount = num_candidates,
+            .pDrmFormatModifiers = candidates,
+         };
+         const VkImageCreateInfo image_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &mod_info,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = { width, height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            .usage = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+         };
+         VkImage probe = VK_NULL_HANDLE;
+         if (enc.CreateImage(enc.dev, &image_info, NULL, &probe) == VK_SUCCESS) {
+            VkImageDrmFormatModifierPropertiesEXT chosen_props = {
+               .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
+            };
+            if (GetImageDrmFormatModifierPropertiesEXT(enc.dev, probe, &chosen_props) ==
+                VK_SUCCESS)
+               chosen = chosen_props.drmFormatModifier;
+            enc.DestroyImage(enc.dev, probe, NULL);
          }
       }
    }
+   return chosen;
+}
+
+uint64_t
+vtest_gpu_encode_discover_modifier(uint32_t drm_format, uint32_t width, uint32_t height)
+{
+   const VkFormat format = drm_format_to_vk(drm_format);
+   pthread_mutex_lock(&enc_mutex);
+   uint64_t chosen = discover_modifier_locked(format, width, height,
+                                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                              VK_IMAGE_USAGE_SAMPLED_BIT |
+                                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                              VK_IMAGE_USAGE_TRANSFER_DST_BIT);
    pthread_mutex_unlock(&enc_mutex);
    return chosen;
 }
@@ -680,10 +747,86 @@ vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
       return ret;
    }
 
+   /*
+    * Real, load-bearing finding (2026-09-26): `width` is the DISPLAY size
+    * (what Codec2/scrcpy asked for), but the real dma-buf's own allocated
+    * width is often padded/aligned wider than that by whatever allocated
+    * it (GPU/encoder row-alignment requirements) - `stride` (the sender's
+    * plain gralloc byte stride) is the only signal this daemon has of the
+    * buffer's REAL physical width. Confirmed on real hardware: a
+    * 720-wide display size arrived with stride=3072 bytes - 768 pixels at
+    * 4 bytes/px, not 720. Every previous version of this function created
+    * the imported/probe images with extent.width=width (720), i.e. a
+    * width that doesn't match the real memory the dma-buf actually
+    * describes - producing a genuine, deterministic content mismatch
+    * indistinguishable at a glance from a tiling/modifier bug (a
+    * consistent horizontal smear/shear, worst near the corrupted region
+    * and self-similar per test run since the same UI frame reproduces the
+    * same result). The image that actually OWNS this memory (the
+    * probe/import pair below) must be created at the buffer's REAL
+    * (padded) width; only the final copy region into copy_image should
+    * use the smaller DISPLAY width/height, cropping the visible window
+    * out of the wider real buffer.
+    */
+   const uint32_t bpp = drm_format_bpp(drm_format);
+   uint32_t bufWidth = width;
+   if (stride && bpp && stride / bpp > width)
+      bufWidth = stride / bpp;
+
    /* Step 1: plain-import the foreign fd - self-compatible, no export
     * chained (see DEVLOG for why chaining one here silently corrupts data
-    * on this driver instead of failing outright). */
-   const VkSubresourceLayout layout = { .offset = 0, .rowPitch = stride, .size = 0, .arrayPitch = 0, .depthPitch = 0 };
+    * on this driver instead of failing outright).
+    *
+    * Real, load-bearing finding (2026-09-26): for a NON-LINEAR modifier,
+    * VkSubresourceLayout::rowPitch in the explicit import below is NOT a
+    * plain "bytes per row" the way a linear image's would be - it's this
+    * driver's own internal tiled/block-linear pitch, a value this daemon
+    * has no way to derive from `stride` (the sender's plain gralloc
+    * stride, a linear-image concept) with any arithmetic. Using `stride`
+    * there anyway (this function's own earlier version) fed the driver a
+    * layout that doesn't describe the real memory at all, producing
+    * exactly the "recognizable but smeared/noisy" corruption this
+    * project's own Tier 5 investigation already caught in a different
+    * shape. Fixed by asking the SAME driver for the real layout: create a
+    * throwaway image at this exact width/height/format with this exact
+    * modifier (deterministic - same driver, same inputs, same layout as
+    * any other image it allocates this way) and read back its real
+    * rowPitch/offset via vkGetImageSubresourceLayout(), instead of
+    * guessing. For modifier 0 (LINEAR), `stride` is exactly the right
+    * concept and is used as given - only non-linear modifiers need this. */
+   VkSubresourceLayout layout = { .offset = 0, .rowPitch = stride, .size = 0, .arrayPitch = 0, .depthPitch = 0 };
+   if (modifier != 0) {
+      const VkImageDrmFormatModifierListCreateInfoEXT probe_mod_list = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+         .drmFormatModifierCount = 1,
+         .pDrmFormatModifiers = &modifier,
+      };
+      const VkImageCreateInfo probe_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .pNext = &probe_mod_list,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = format,
+         .extent = { bufWidth, height, 1 },
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+      VkImage probe = VK_NULL_HANDLE;
+      if (enc.CreateImage(enc.dev, &probe_info, NULL, &probe) == VK_SUCCESS) {
+         const VkImageSubresource sub = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .arrayLayer = 0 };
+         VkSubresourceLayout real_layout;
+         enc.GetImageSubresourceLayout(enc.dev, probe, &sub, &real_layout);
+         layout = real_layout;
+         enc.DestroyImage(enc.dev, probe, NULL);
+      } else {
+         fprintf(stderr, "encode_dmabuf: probe CreateImage FAILED for modifier=0x%llx\n",
+                 (unsigned long long)modifier);
+      }
+   }
    const VkExternalMemoryImageCreateInfo imported_ext = {
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
       .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
@@ -695,7 +838,7 @@ vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
    };
    const VkImageCreateInfo imported_imginfo = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &explicit_mod,
-      .imageType = VK_IMAGE_TYPE_2D, .format = format, .extent = { width, height, 1 },
+      .imageType = VK_IMAGE_TYPE_2D, .format = format, .extent = { bufWidth, height, 1 },
       .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
       .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
       .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -741,11 +884,36 @@ vtest_gpu_encode_dmabuf(int fd, uint32_t width, uint32_t height,
    if (vr != VK_SUCCESS)
       goto out;
 
-   /* Step 2: (re)configure the persistent copy target if the resolution
-    * changed since the last call. */
+   /*
+    * Step 2: (re)configure the persistent copy target if the resolution
+    * changed since the last call.
+    *
+    * Real, load-bearing finding (2026-09-26): copy_image's own modifier
+    * must NOT be forced to match the source's - the two are independent
+    * concerns. The source (`modifier`, above) describes memory this
+    * daemon doesn't own and must import exactly as given (confirmed
+    * DRM_FORMAT_MOD_LINEAR/0 for a real GraphicBufferSource capture
+    * buffer on this stack). copy_image is a surface THIS module creates
+    * fresh and hands to NVENC via CUDA-array interop (see
+    * NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY below) - which wants whatever
+    * layout the driver itself considers optimal for that purpose, almost
+    * certainly non-linear, regardless of how the source happened to be
+    * laid out. Forcing copy_image's own candidate list down to just the
+    * source's modifier (this function's own earlier version) silently
+    * forced copy_image to LINEAR too whenever the source was, producing
+    * a real, distinct corruption downstream of the (already-fixed)
+    * source-import bug. Discover copy_image's own modifier the same way
+    * vtest_gpu_alloc.c's allocator would for a fresh renderable surface -
+    * entirely independent of the source. */
    if (width != enc.cur_w || height != enc.cur_h) {
-      uint64_t mods[1] = { modifier };
-      ret = encode_reconfigure_locked(width, height, modifier, mods, 1);
+      const VkImageUsageFlags copy_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                           VK_IMAGE_USAGE_SAMPLED_BIT |
+                                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      uint64_t copy_modifier =
+         discover_modifier_locked(VK_FORMAT_B8G8R8A8_UNORM, width, height, copy_usage);
+      uint64_t mods[1] = { copy_modifier };
+      ret = encode_reconfigure_locked(width, height, copy_modifier, mods, 1);
       if (ret)
          goto out;
    }

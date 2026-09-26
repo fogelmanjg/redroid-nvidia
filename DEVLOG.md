@@ -2338,3 +2338,99 @@ uniformly black" symptom is gone, replaced by a symptom this project already has
 playbook for. **Next session**: apply Tier 5's own untiling-readback approach (or a correctly
 paired stride/modifier, now that a clean baseline exists to test against) to this specific
 SCM_RIGHTS-sourced buffer.
+
+### 2026-09-26 (same day, continued yet further still): the checkerboard bug, solved - three real bugs, one wrong assumption exposed by direct evidence
+
+Picked up exactly where the previous entry left off: apply a correct stride/modifier pairing to the
+SCM_RIGHTS-sourced buffer. What actually happened took several wrong turns before landing on the
+real fix - each one a genuine finding worth keeping, since the wrong turns are what eventually
+forced the evidence that solved it.
+
+**Wrong turn 1: "this driver exposes one non-linear candidate, just pick it."** Added logging to
+`vtest_gpu_encode_discover_modifier()` and found the opposite: **six** real non-linear candidates
+for `AB24`/`ABGR8888` on this RTX 4060 (`0x300000000606010` through `...015`), differing only in
+NVIDIA's own low-nibble block-height field of its public `BLOCK_LINEAR_2D` modifier encoding - a
+real tiling parameter the driver picks based on the image's actual height. The existing code just
+took the first match, with no basis for picking the *correct* one among six. Fixed properly by
+mirroring `vtest_gpu_alloc.c`'s own pattern: create a throwaway image with the full candidate list
+via `VkImageDrmFormatModifierListCreateInfoEXT` and read back which one the driver *actually*
+assigned via `vkGetImageDrmFormatModifierPropertiesEXT()` - the same choice the driver would make
+for a real allocation at this size, not a guess. Real fix, kept - but the corrupted frame that came
+out the other end was pixel-for-pixel *unchanged*. Something else was still wrong.
+
+**Wrong turn 2: the explicit import's `rowPitch` used the sender's plain gralloc `stride` directly.**
+For a non-linear modifier, `VkSubresourceLayout::rowPitch` in an explicit-layout import isn't a
+plain byte stride the way a linear image's is - it's the driver's own internal tiled pitch, which
+`stride` (a linear-image concept) can't supply by arithmetic. Fixed the same way as the modifier
+itself: probe a throwaway image at the real modifier, read back its real layout via
+`vkGetImageSubresourceLayout()`, use *that*. Also real, also kept - and also produced a
+byte-for-byte identical corrupted frame. That result should have been the tell: if changing the
+pitch fed into an import changes nothing about the output, the import isn't the thing reading it
+wrong.
+
+**Wrong turn 3, and the width bug that was real: `width` is the display size, not the buffer's own
+size.** Added a one-line diagnostic print of the values actually flowing through
+`vtest_gpu_encode_dmabuf()` and found `stride=3072` for a 720-wide frame - 768 pixels at 4
+bytes/px, not 720. Every image this daemon created for the imported/probed buffer used
+`extent.width = width` (720): a width that doesn't match the memory the dma-buf actually
+describes. `NvencEncComponent.cpp`'s own comment already separately confirmed this same wrapper
+carries an aligned/padded width at a different offset than the display width it also reports -
+this daemon just wasn't using it. Fixed by deriving the buffer's real width from
+`stride / bytes_per_pixel` and using *that* for the imported/probe images, cropping down to the
+display width/height only in the final copy region. Confirmed self-consistent immediately: the
+probed real rowPitch for a 768-wide image came back as exactly 3072 - matching the sender's stride
+exactly. A real, necessary fix - and the resulting frame *changed* (proof something upstream of the
+copy was now different) but was still corrupted, in a similar smeared way.
+
+**The actual breakthrough: stop guessing, look at the real bytes.** Three plausible-sounding fixes
+in and the picture was still wrong, which means the remaining theories (tiling variant, pitch,
+width) were treating symptoms of something not yet directly observed. Added a five-line temporary
+diagnostic to the daemon: `mmap()` the raw dma-buf fd directly with `PROT_READ`, bypassing Vulkan,
+CUDA and every modifier-interpretation theory entirely, and dump the bytes to a file. Rendered them
+as plain, tightly-packed linear RGBA at the now-known-correct 768×1280 real width. **The actual
+Android home screen came out immediately and almost perfectly recognizable** - search bar, Google
+logo, wallpaper, every launcher icon in the right place - with only a minor, separate artifact
+(thin scattered horizontal dropout lines, most consistent with a synchronization/torn-write issue
+in the *source* buffer, not with anything this project's own pipeline does to it).
+
+This settled the real question directly instead of arguing about it further: **this buffer is
+genuinely `DRM_FORMAT_MOD_LINEAR` (0)**, exactly as the sender had reported all along (there's no
+identifiable modifier field in this wrapper, so it reports 0 - correctly, as it turns out). The bug
+was never in the modifier math. The bug was that `nvenc_scm_daemon.c`'s own `handle_connection()`
+treated a reported `modifier == 0` as "unknown, please guess" and called
+`vtest_gpu_encode_discover_modifier()` to replace it with a real, confirmed, but *wrong* non-linear
+modifier - forcing a genuinely linear buffer through tiled-import machinery for every single frame
+this transport has ever encoded. Fixed by trusting the sender's `0` as a real answer: removed the
+override entirely, `modifier = req.modifier` unconditionally now.
+
+**One more independent bug, found immediately after by symptom, not by theory**: with the source
+import finally correct, the encoded frame was *still* wrong, but visibly differently wrong (a
+diagonal shear/wave pattern, not the earlier checkerboard) - and structurally more damaged than the
+now-known-good raw source bytes. The remaining culprit: `encode_reconfigure_locked()`'s own
+`copy_image` (the persistent surface this module owns and hands to NVENC via
+`NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY`) was being created with its modifier candidate list forced
+down to a single entry - whatever the *source's* modifier turned out to be (now correctly 0,
+meaning `copy_image` was being forced to LINEAR too). But `copy_image` is a surface this module
+allocates fresh for NVENC's own benefit - its ideal layout is a completely independent question
+from whatever the source happened to use, and NVENC/CUDA-array interop almost certainly wants
+whatever the driver considers optimal for that role, not "whatever the source was." Fixed by
+refactoring `vtest_gpu_encode_discover_modifier()` into a lock-free `discover_modifier_locked()`
+core (needed since `vtest_gpu_encode_dmabuf()` already holds `enc_mutex` at this call site) and
+using it to pick `copy_image`'s own modifier independently, from its own real candidate list, every
+time it's (re)configured.
+
+**Result: a real, correctly-positioned, correctly-colored Android home screen, decoded from actual
+NVENC hardware output** - search bar, wallpaper, every icon exactly where it belongs. The only
+remaining artifact is the same scanline-level dropout noise already present in the raw,
+unprocessed source bytes, confirmed via the mmap dump above - i.e. it's upstream of this project's
+own encode pipeline entirely, not introduced by it. Four real, independent bugs fixed this session:
+the modifier-candidate selection (kept, matters for the still-separate `VCMD_ENCODE_RESOURCE`
+transport, which really can carry non-zero source modifiers), the explicit-layout rowPitch source
+(kept, same reasoning), the display-vs-real buffer width mismatch (kept, load-bearing), the
+wrongly-overridden source modifier (the actual root cause of the checkerboard), and copy_image's
+modifier wrongly tied to the source's (the actual root cause of the final shear). **Next session**:
+characterize the remaining scanline dropout - likely a producer-side synchronization gap (the
+earlier-tried `block.fence().wait()` in `NvencEncComponent.cpp` failed at the Vulkan-semaphore-import
+layer specifically, which doesn't rule out synchronization in general, just that specific
+primitive); consider a plain kernel-level `DMA_BUF_IOCTL_SYNC` wait instead, since redroid's shared
+kernel makes that available without needing a Vulkan/CUDA fence import at all.
