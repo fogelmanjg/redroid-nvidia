@@ -2160,3 +2160,92 @@ entirely for this path (e.g., importing without `VK_IMAGE_TILING_DRM_FORMAT_MODI
 platform's dma-buf import allows an implicit/opaque tiling negotiation instead of a caller-supplied
 explicit one), or find a way to query stride and modifier as a *matched pair* from the same source
 for a buffer this component didn't allocate - genuinely open, not yet attempted.
+
+## 2026-09-26 (same day, continued further still) — Three real, live-debugged fixes with the user directly connected, and the actual remaining crash root-caused to a specific Mesa/Venus assert
+
+Continued live, with the user connecting via `scrcpy` themselves while checking each finding in
+real time - a genuinely different, faster debugging loop than the usual "deploy, headless test,
+inspect" cycle, since crashes and symptoms could be reproduced and correlated within seconds of
+them happening on real hardware.
+
+**Fix 1 - a real GEM handle leak, confirmed as a contributing cause of an intermittent
+SurfaceFlinger crash.** `NvencEncComponent::renderNodeFd()` keeps one render-node fd open for the
+component's entire lifetime (by design, documented in its own header), but
+`vtest_encode_resolve_res_id()` imported a brand new local GEM handle via
+`DRM_IOCTL_PRIME_FD_TO_HANDLE` on every single call and never released it - a real, unbounded leak
+into that one fd's own handle table. Caught red-handed: a completely unrelated buffer (a 108x108
+right-click context-menu icon, nothing to do with this component at all) triggered
+`DRM_IOCTL_GEM_CLOSE failed (handle=1) error -1` in `nvidia_venus.c`'s own logging, immediately
+before SurfaceFlinger's RenderEngine aborted - the exact leaked handle number. Fixed by adding
+`DRM_IOCTL_GEM_CLOSE` right after resolving the resource id; nothing past that point needs the
+local handle. Real, but (as later confirmed) not the *only* cause of this crash - see below.
+
+**Fix 2 - `force_idr`, closing the loop on the "not a config packet" / "non-existing PPS"
+family of errors for good.** The persistent host-side encoder session
+(`vtest_gpu_encode.c`) only re-initializes NVENC - where `repeatSPSPPS` lives - on a genuine
+*resolution* change, never on a new streaming session at the same resolution. Every earlier test
+in this arc needed a fresh `virgl_test_server` restart before each single attempt to get a valid
+IDR+SPS/PPS, which is obviously not sustainable for a real user connecting and reconnecting.
+Added a `force_idr` field to the SCM_RIGHTS wire protocol and
+`vtest_gpu_encode_force_idr()` (resets the persistent session's cached resolution, forcing the next
+call to re-run `encode_reconfigure_locked()` regardless of size match) on the host side; the
+component now requests it on its own first call, using the same `mCsdSent` flag already tracking
+whether a CSD has been produced yet. **Confirmed reliable across multiple consecutive live
+connection attempts with zero server/container restarts in between** - the exact fragility this
+was meant to fix.
+
+**Fix 3 - the real reason the hardware and software encoders never appeared together, and it
+was never actually a "both vs. either/or" limitation.** The user asked the sharp, right question
+directly: does enabling the hardware encoder inherently exclude the software one, and how does
+redroid-hwenc's own AMD/Intel deployment look by comparison? Checked redroid-hwenc's own README
+directly rather than assume: `"scrcpy picks up c2.hardware.encoder.h264 automatically... with no
+changes to redroid or scrcpy needed at all"` - i.e. coexistence is normal and expected, not
+something this project should have to fight for. Traced the actual mechanism with real
+tools instead of guessing: `dumpsys android.hardware.media.c2.IComponentStore/software` (the exact
+binder name `Codec2Client` queries in AIDL mode) reported **`NONE`** - a real, empty stub, while
+`lshal` confirmed the *actual* working software codecs are a genuine, separate legacy HIDL service
+(`android.hardware.media.c2@1.0/1.1/1.2::IComponentStore/software`, backed by the real
+`mediaswcodec` process, pid confirmed via `/proc/<pid>/cmdline`). The root cause:
+`mediaswcodec` decides **once, at its own process startup**, which interface(s) to register,
+based on `media.c2.hal.selection` *at that moment* - since it starts early in boot, long before
+this session's runtime `setprop`/`device_config put` calls ever ran, it had already committed to
+HIDL-only. Restarting `mediaserver` alone (the existing, already-known fix for its own stale
+*client-side* cache) does nothing for this - it's a completely different process with a completely
+different, one-time startup decision. **Fix: `kill -9` on `mediaswcodec` itself, after setting the
+properties**, forcing it to restart and re-evaluate - confirmed immediately via `dumpsys` going
+from `NONE` to a full, real component list, and `scrcpy --list-encoders` then showing
+`c2.hardware.encoder.h264 (hw) [vendor]` *and* `c2.android.avc.encoder (sw)` *side by side*, freely
+selectable via scrcpy's own `--video-encoder` flag with no other change needed - exactly matching
+redroid-hwenc's own experience once done correctly, confirming this was never an inherent
+either/or limitation, only an ordering bug in *this* session's own setup sequence.
+
+**With all three fixes in place, the user connected live and it still crashed** - same exact
+`SIGABRT` in `vn_ring_submit_locked`, called from
+`vn_GetPhysicalDeviceFormatProperties2`/`vn_GetAndroidHardwareBufferPropertiesANDROID`, same full
+stack down to `SkiaRenderEngine::mapExternalTextureBuffer`, confirming the GEM leak (fix 1) was a
+real bug but not the sole cause - this crash is more fundamental. Read the actual Mesa source for
+`vn_ring_submit_locked` (`external/mesa3d/src/virtio/vulkan/vn_ring.c`, from this project's own
+earlier `0001-venus-vtest-sync-fd-and-dma-buf-import-plus-fixes.patch`) rather than keep guessing
+from stack traces alone: the function and its helpers (`vn_ring_cs_upload_locked`,
+`vn_ring_submission_prepare`) carry several live `assert()`s on internal command-stream-encoder
+state (`cs->storage_type == VN_CS_ENCODER_STORAGE_POINTER && cs->buffer_count == 1`, `cs_size ==
+vn_cs_encoder_get_len(cs)`) - on a userdebug build, these are real, active checks, not compiled out.
+The exact same `vn_GetAndroidHardwareBufferPropertiesANDROID` call chain was already confirmed
+**reliably working**, repeatedly, for many different buffer sizes/formats back in Tier 4's own
+`REDROID-DIAG`-instrumented testing - the one thing different about *this* buffer is that it's the
+first-ever `HW_VIDEO_ENCODER`-usage buffer this exact code path has had to handle: `nvidia_venus.c`
+allocates it GPU-only/`OPTIMAL`-tiled (`alloc_flags=0x0`, no `MAPPABLE`, per Tier 4's own documented
+behavior), unlike every buffer Tier 4's own testing used. **Working hypothesis, not yet confirmed**:
+something about querying AHB format properties for a non-mappable, GPU-only-tiled buffer corrupts
+or exhausts the ring's own command-stream encoder state in a way ordinary (mappable) buffers never
+did - genuinely new territory for this already-proven-working call chain, not a regression in
+anything touched today.
+
+**Where this leaves the project**: the three fixes above are real, valuable, and committed
+independently of whatever remains broken - a live connection is now far more resilient (no
+`virgl_test_server` restart choreography needed, both encoders freely selectable) even though the
+hardware path itself still crashes intermittently and the picture is still black when it doesn't.
+**Next concrete step**: instrument `vn_ring_cs_upload_locked`/`vn_ring_submission_prepare` (or
+whichever of their internal asserts is the one actually firing - not yet pinned down to a single
+line) specifically for a `HW_VIDEO_ENCODER`-usage buffer's format-properties query, to find what's
+actually different about this call versus the many confirmed-working ones from Tier 4.

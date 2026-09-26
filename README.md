@@ -606,6 +606,49 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       without any Vulkan validation error while still being silently wrong — genuinely the next
       thing to test, not yet attempted.
 
+      **Same day, continued live with the user directly connected — three real fixes landed, and
+      the actual crash root-caused to a specific Mesa/Venus internal.** (1) A genuine GEM handle
+      leak: `NvencEncComponent` keeps one render-node fd open for its whole lifetime but never
+      released the local handle `DRM_IOCTL_PRIME_FD_TO_HANDLE` creates on every call — caught via a
+      completely unrelated buffer (a 108×108 right-click context-menu icon) hitting
+      `DRM_IOCTL_GEM_CLOSE failed (handle=1)` for the exact leaked number, immediately before a
+      SurfaceFlinger crash. Fixed with an explicit `DRM_IOCTL_GEM_CLOSE`. (2) `force_idr`: the
+      persistent host-side encoder session only re-initializes NVENC (`repeatSPSPPS`) on a
+      resolution change, never a new session at the same size — every earlier test needed a full
+      `virgl_test_server` restart first. Added a wire-protocol flag and
+      `vtest_gpu_encode_force_idr()`, requested automatically on the component's own first call —
+      confirmed reliable across multiple live reconnects with zero restarts needed. (3) The
+      hardware and software encoders were never actually mutually exclusive — the user asked
+      directly whether they should coexist, and checking redroid-hwenc's own README confirmed they
+      do, normally, with no special handling. Root cause: `mediaswcodec` decides once, at its own
+      process startup, whether to register AIDL or HIDL, based on `media.c2.hal.selection` *at that
+      moment* — since it starts early in boot, this session's runtime property changes never
+      reached it. `dumpsys android.hardware.media.c2.IComponentStore/software` showing `NONE` (a
+      real empty stub) while `lshal` showed the genuine software codecs living in a separate legacy
+      HIDL service confirmed it. Fix: `kill -9` on `mediaswcodec` itself (not just `mediaserver`)
+      after setting the properties — `scrcpy --list-encoders` then showed both
+      `c2.hardware.encoder.h264 (hw)` and `c2.android.avc.encoder (sw)` side by side, freely
+      selectable.
+
+      **With all three fixes live, the crash still happened** — identical `SIGABRT` in
+      `vn_ring_submit_locked`, same full stack through `SkiaRenderEngine::mapExternalTextureBuffer`.
+      Read the actual Mesa source (`external/mesa3d/src/virtio/vulkan/vn_ring.c`) rather than keep
+      guessing from stack traces: the function and its helpers carry several live `assert()`s on
+      internal command-stream-encoder state, real and active on this userdebug build. The exact
+      same AHB-properties call chain was already confirmed reliably working, repeatedly, back in
+      Tier 4's own testing — the one difference this time is that it's the first-ever
+      `HW_VIDEO_ENCODER`-usage buffer (GPU-only/`OPTIMAL`-tiled, no `MAPPABLE`, per Tier 4's own
+      documented allocation behavior) this exact code path has had to handle. **Working hypothesis,
+      not yet confirmed**: querying AHB format properties for a non-mappable, GPU-only-tiled buffer
+      corrupts or exhausts the ring's own encoder state in a way ordinary buffers never did.
+
+      **Net effect of this session**: connecting is now far more resilient (no restart
+      choreography, both encoders freely selectable) even though the hardware path still crashes
+      intermittently and the picture is still black when it doesn't. Next step: instrument
+      `vn_ring_cs_upload_locked`/`vn_ring_submission_prepare` for a `HW_VIDEO_ENCODER`-usage
+      buffer's format-properties query specifically, to pin down which assert fires and why this
+      call differs from Tier 4's own confirmed-working ones.
+
       See DEVLOG's 2026-09-26 entries for the full detail, and
       [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
       external to the repo) for the host-prerequisite checklist this session re-applied after a
