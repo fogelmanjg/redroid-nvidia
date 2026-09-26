@@ -183,6 +183,15 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
     // vtest_gpu_encode.c, unlike VA-API's daemon, currently trusts whatever
     // modifier the wire protocol sends for the plain-import step).
     C2ConstGraphicBlock block = inputBuffer->data().graphicBlocks().front();
+    // Tried waiting on block.fence() here on the theory that the GPU
+    // compositor might still be writing when process() runs (every frame
+    // came back uniformly black without it). Reverted: the wait itself
+    // fails at the driver level every single call
+    // (nv_drm_prime_fence_context_create_ioctl: "Failed to import fence
+    // semaphore surface", confirmed correlated 1:1 with encode calls, zero
+    // occurrences otherwise) rather than actually blocking, so it protects
+    // nothing in this environment - and frames were still black anyway. The
+    // real cause is still open; see DEVLOG's 2026-09-26 entry.
     const C2Handle *const handle = block.handle();
     if (!handle || handle->numFds < 1) {
         ALOGE("input graphic block has no dma-buf fd");

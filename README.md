@@ -584,6 +584,28 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       networking) down with it — not confirmed as cause vs. coincidence, but worth avoiding rapid-
       fire restarts back to back regardless.
 
+      **Same day, continued further — a complete, valid, correctly-muxed H.264/MP4 recorded end to
+      end for the first time, and a new, real content bug found underneath the plumbing.** Against
+      a genuinely fresh encoder session, `scrcpy --record` completed with zero errors:
+      `ffprobe` confirms a fully valid MP4, H.264 High profile, 720×1280, `probe_score=100` — every
+      plumbing bug from earlier today (registration, shared libraries, `media_codecs.xml`,
+      `repeatSPSPPS`, the CSD split) is now confirmed fixed *together*, the first complete recording
+      this project has ever produced through the hardware path. But the picture itself is wrong —
+      every frame across two separate recordings measured uniformly black (`YAVG=16`, zero
+      variance), not corrupted or noisy. Tested a missing-fence-wait theory directly and ruled it
+      out (the wait fails at the driver level every call — `nv_drm_prime_fence_context_create_ioctl:
+      Failed to import fence semaphore surface`, correlated 1:1 with encode calls — rather than
+      actually blocking, so it wasn't protecting anything; reverted). **Leading theory**: this
+      path's `stride` (read from an unidentified offset in the generic wrapper handle) and
+      `modifier` (separately *discovered* by asking the driver, since the wrapper has no
+      identifiable modifier field) get paired into the same Vulkan explicit plane layout for the
+      import step — but for any non-linear modifier, "row pitch" means whatever that specific
+      proprietary tiling scheme defines it to mean, not a plain byte stride computable
+      independently of it. Pairing two values from unrelated sources with no guarantee they ever
+      described the same real layout is a plausible way to get an image that creates and copies
+      without any Vulkan validation error while still being silently wrong — genuinely the next
+      thing to test, not yet attempted.
+
       See DEVLOG's 2026-09-26 entries for the full detail, and
       [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
       external to the repo) for the host-prerequisite checklist this session re-applied after a

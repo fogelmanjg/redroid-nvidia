@@ -2093,3 +2093,70 @@ flag never set, also hit a boot hang once under the same rapid-restart condition
 clean on the very next attempt with no changes at all. Logged as a real, reproducible-enough
 caution for next time (avoid rapid-fire container/vtest-server restarts back to back; give each one
 time to fully settle) rather than a confirmed root cause.
+
+## 2026-09-26 (same day, continued further) — A complete, valid, correctly-muxed H.264/MP4 recorded end to end for the first time — and a new, real content bug found underneath the plumbing bugs
+
+Deployed the full NVENC service (binary + all 45 shared libraries from the earlier recursive
+`readelf` closure + the CSD-split fix) into a fresh container, this time re-applying
+`debug.stagefright.ccodec=4`/`debug.stagefright.c2inputsurface=-1` directly via `setprop` at
+runtime rather than the boot-cmdline gate (simpler when the container wasn't launched with
+`androidboot.use_redroid_c2=1` in the first place - these are plain `debug.*` properties, not
+`ro.*`, so nothing stops setting them after boot). Confirmed `c2.hardware.encoder.h264 (hw)
+[vendor]` registered and listed by a real `scrcpy --list-encoders` again.
+
+**First real milestone: `scrcpy --record` completed successfully, zero errors, against a genuinely
+fresh encoder session** (the vtest server this test connected to had never encoded a single frame
+before, so `encode_reconfigure_locked()` correctly fired and applied `repeatSPSPPS`). `ffprobe`
+confirms a **fully valid, correctly muxed MP4**: real H.264 High profile, 720×1280, 11 frames,
+`extradata_size=40` (the SPS+PPS the CSD-split fix produced, now living where a real MP4 container
+expects it), `probe_score=100`. This is the first time in this project's entire history that a real
+client recorded a complete, structurally correct video file through the hardware encoder path -
+every plumbing bug from today's earlier entries (service registration, shared-library closure,
+`media_codecs.xml`, `repeatSPSPPS`, the CSD/`configUpdate` split) is now confirmed fixed together,
+not just individually.
+
+**But the actual picture is wrong**: extracted a frame and inspected it directly rather than
+declare victory on file validity alone - solid black. Checked `signalstats`' `YAVG` across every
+frame of two separate recordings (11 frames, then 22): **exactly `16` (limited-range black) on
+every single frame, zero variance** - not a corrupted/garbled read (which would show noise or
+structure, matching Tier 5's own well-documented 64-byte-grid pattern), not a warm-up artifact
+(persists across the entire clip, not just frame 0). Two theories tested directly rather than
+assumed:
+
+1. **A missing producer-fence wait.** `SurfaceFlinger`'s `GraphicBufferSource` hands a captured
+   buffer to a consumer together with an acquire fence a real `BufferQueue` consumer is supposed to
+   wait on before touching the memory, in case the GPU compositor is still writing when the buffer
+   is dequeued - `NvencEncComponent::process()` reads the fd immediately with no such wait at all.
+   Added `block.fence().wait(...)` right after obtaining the block. **Ruled out**: `logcat` showed
+   a kernel-level `nv_drm_prime_fence_context_create_ioctl: *ERROR* Failed to import fence
+   semaphore surface` correlated 1:1 with every single encode call (22 errors for 22 frames, zero
+   anywhere else in a 200-line window before this code ran) - the wait fails at the driver level
+   every time rather than actually blocking, so it protects nothing in this specific environment.
+   Reverted (kept as a documented, ruled-out theory in the component's own comment, not a live
+   no-op) rather than left in as false reassurance.
+2. **Format mapping.** Directly confirmed `libdrm`'s own `DRM_FORMAT_ABGR8888 = fourcc_code('A',
+   'B','2','4') = 0x34324241` matches exactly what the raw handle dump showed, and
+   `drm_format_to_vk()` maps it to `VK_FORMAT_R8G8B8A8_UNORM` correctly - format identification
+   itself isn't the bug.
+
+**Leading theory, not yet tested**: this SCM_RIGHTS path derives `stride` from one specific integer
+offset inside the still-unidentified generic wrapper handle, and separately derives `modifier` from
+`vtest_gpu_encode_discover_modifier()` (a driver query, independent of the buffer's actual origin).
+Those two values are then both fed into the *same* `VkImageDrmFormatModifierExplicitCreateInfoEXT`
+plane layout for the plain-import step - but for anything other than `DRM_FORMAT_MOD_LINEAR`, a
+"row pitch" is not a simple linear byte-stride at all; it's specific to whatever proprietary tiling
+arrangement that exact modifier defines, defined by the driver, not computable independently by
+whoever happens to be sending the request. Pairing a stride read from an unrelated part of an
+unknown struct with a modifier discovered through a completely different, unrelated query - with no
+guarantee the two ever described the same real layout to begin with - is a very plausible way to
+get an image that creates and copies without any Vulkan validation error (nothing here is exposed
+to CPU-side validation the way the plain byte comparison in Tier 5's own bug was) while still being
+wrong, silently. The existing Venus-owned-resource path (`VCMD_ENCODE_RESOURCE`) never has this
+problem, since Venus's own resource creation is the one true source of both values together,
+already proven correct across three real spikes.
+
+**Not yet fixed** - the next concrete step: either avoid the explicit modifier/stride pairing
+entirely for this path (e.g., importing without `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` if this
+platform's dma-buf import allows an implicit/opaque tiling negotiation instead of a caller-supplied
+explicit one), or find a way to query stride and modifier as a *matched pair* from the same source
+for a buffer this component didn't allocate - genuinely open, not yet attempted.
