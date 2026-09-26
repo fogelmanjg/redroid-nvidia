@@ -159,47 +159,65 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
 
     // Same fd-extraction spirit as VaapiEncComponent's own process() (and
     // v4l2_codec2's createInputFrame() before it): read the native_handle_t
-    // directly, no block.map()/layout() call. Unlike VaapiEncComponent,
-    // this project's actual gralloc HAL (minigbm's cros_gralloc, confirmed
-    // active in Tier 4) produces a real, known cros_gralloc_handle_t for
-    // every buffer - no empirical reverse-engineering needed here, just the
-    // same validation cros_gralloc_convert_handle() itself does.
+    // directly, no block.map()/layout() call. This project's own gralloc HAL
+    // (minigbm's cros_gralloc) produces a real cros_gralloc_handle_t for a
+    // hand-built C2Work test buffer - handled below as the primary path -
+    // but a genuine Surface-sourced frame (scrcpy's virtual-display capture
+    // via GraphicBufferSource) does NOT arrive this way, confirmed on real
+    // hardware: numFds=1, numInts=46 (vs. 36 for a real cros_gralloc_handle).
+    // Exactly the same discovery VaapiEncComponent's own header already
+    // documents for AMD/Intel (its own equivalent buffer measured numFds=1,
+    // numInts=23) - some other, more generic native_handle_t this pipeline
+    // uses when GraphicBufferSource hands over a captured frame, not this
+    // vendor's own gralloc wire format. Offsets below are empirical (dumped
+    // the raw ints across two different scrcpy-driven resolutions - a native
+    // 720x1280 capture and a -m800-constrained 450x800 one - and confirmed
+    // the same four offsets track the real, independently-known values in
+    // both: width/height exactly match each resolution's real dimensions,
+    // the stride-shaped value at offset 4 combined with height reproduces
+    // the total-size value at offset 12 exactly (stride*height) for both
+    // resolutions, and the format offset holds the DRM fourcc 'AB24' -
+    // ABGR8888 - in both). No identifiable modifier field in this wrapper;
+    // passed as 0 and left for the host side to determine independently if
+    // that turns out not to be good enough (this project's own
+    // vtest_gpu_encode.c, unlike VA-API's daemon, currently trusts whatever
+    // modifier the wire protocol sends for the plain-import step).
     C2ConstGraphicBlock block = inputBuffer->data().graphicBlocks().front();
     const C2Handle *const handle = block.handle();
-    if (!handle) {
-        ALOGE("input graphic block has no handle");
+    if (!handle || handle->numFds < 1) {
+        ALOGE("input graphic block has no dma-buf fd");
         work->result = C2_CORRUPTED;
         work->workletsProcessed = 1u;
         return;
     }
-    if (sizeof(native_handle_t) + sizeof(int) * (size_t)(handle->numFds + handle->numInts) !=
-        sizeof(cros_gralloc_handle)) {
-        ALOGE("input handle isn't a cros_gralloc_handle (numFds=%d numInts=%d, expected total "
-              "%zu ints for a real cros_gralloc_handle)",
-              handle->numFds, handle->numInts,
-              (sizeof(cros_gralloc_handle) - sizeof(native_handle_t)) / sizeof(int));
-        {
-            const int32_t *raw = handle->data;
-            std::string fdsDump, intsDump;
-            for (int i = 0; i < handle->numFds; i++) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d ", raw[i]);
-                fdsDump += buf;
-            }
-            for (int i = 0; i < handle->numInts; i++) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "0x%x ", raw[handle->numFds + i]);
-                intsDump += buf;
-            }
-            ALOGE("raw handle dump: fds=[%s] ints=[%s]", fdsDump.c_str(), intsDump.c_str());
-        }
-        work->result = C2_CORRUPTED;
-        work->workletsProcessed = 1u;
-        return;
-    }
-    auto hnd = reinterpret_cast<cros_gralloc_handle_t>(handle);
-    if (hnd->magic != kCrosGrallocMagic) {
-        ALOGE("input handle has the wrong magic (0x%08x)", hnd->magic);
+
+    int dmabufFd;
+    uint32_t width, height, stride, drmFormat;
+    uint64_t formatModifier;
+
+    const bool looksLikeCrosGralloc =
+            sizeof(native_handle_t) + sizeof(int) * (size_t)(handle->numFds + handle->numInts) ==
+            sizeof(cros_gralloc_handle);
+    if (looksLikeCrosGralloc &&
+        reinterpret_cast<cros_gralloc_handle_t>(handle)->magic == kCrosGrallocMagic) {
+        auto hnd = reinterpret_cast<cros_gralloc_handle_t>(handle);
+        dmabufFd = hnd->fds[0];
+        width = hnd->width;
+        height = hnd->height;
+        stride = hnd->strides[0];
+        drmFormat = hnd->format;
+        formatModifier = hnd->format_modifier;
+    } else if (handle->numFds == 1 && handle->numInts >= 20) {
+        const int32_t *ints = &handle->data[handle->numFds];
+        dmabufFd = handle->data[0];
+        stride = (uint32_t)ints[4];
+        width = (uint32_t)ints[17];
+        height = (uint32_t)ints[18];
+        drmFormat = (uint32_t)ints[19];
+        formatModifier = 0; /* not identifiable in this wrapper, see above */
+    } else {
+        ALOGE("input handle matches neither known layout (numFds=%d numInts=%d)", handle->numFds,
+              handle->numInts);
         work->result = C2_CORRUPTED;
         work->workletsProcessed = 1u;
         return;
@@ -211,7 +229,7 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
         work->workletsProcessed = 1u;
         return;
     }
-    uint32_t resId = vtest_encode_resolve_res_id(fd, hnd->fds[0]);
+    uint32_t resId = vtest_encode_resolve_res_id(fd, dmabufFd);
     if (!resId) {
         ALOGE("failed to resolve a Venus resource id for this buffer");
         work->result = C2_CORRUPTED;
@@ -221,8 +239,8 @@ void NvencEncComponent::process(const std::unique_ptr<C2Work> &work,
 
     uint8_t *coded = nullptr;
     uint32_t codedSize = 0;
-    int ret = vtest_encode_resource(resId, hnd->width, hnd->height, hnd->format, hnd->strides[0],
-                                     hnd->format_modifier, &coded, &codedSize);
+    int ret = vtest_encode_resource(resId, width, height, drmFormat, stride, formatModifier,
+                                     &coded, &codedSize);
     if (ret) {
         ALOGE("vtest_encode_resource failed: %d", ret);
         work->result = C2_CORRUPTED;

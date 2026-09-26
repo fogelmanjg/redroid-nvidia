@@ -139,3 +139,21 @@ magic constant, `0xabcddcba`, matches nothing in this project's own AOSP tree). 
 turn this raw capture into a second parsing path in `process()`, the same shape as
 `VaapiEncComponent`'s own non-cros_gralloc fallback, then check 3 (the actual encode round trip) is
 what's left to close the whole arc.
+
+**Update, 2026-09-26 (same day, part 3): the fallback parser is built and confirmed correct — cross-
+validated against two real captures at different resolutions, not just one — but resolving the
+buffer's Venus resource id now fails, for a real architectural reason, not a bug.**
+`vtest_encode_resolve_res_id()`'s `DRM_IOCTL_VIRTGPU_RESOURCE_INFO` call returns `ENOMEM` for this
+buffer. Confirmed why: `/dev/dri/renderD128` in this container is the real NVIDIA render node
+(`DRIVER=nvidia`), not a virtio-gpu device — there's no actual virtio-gpu kernel driver in this
+container-based architecture at all. The one prior "confirmation" of this resolution mechanism
+(`tests/tier7_vcmd_encode_resource_test.c`) only worked because that test's buffer was allocated by
+this project's own `nvidia_venus.c` Venus path in the first place; `scrcpy`'s real
+`GraphicBufferSource` capture buffer is a genuine dma-buf that was never allocated that way, so
+virglrenderer's resource table has no entry for it — `virgl_renderer_resource_export_blob()` cannot
+resolve a resource id that was never registered, regardless of how correctly the handle gets parsed.
+**The fix isn't in this parsing code at all**: this class of buffer needs redroid-hwenc's own proven
+`SCM_RIGHTS` Unix-socket fd-passing transport (valid here specifically because redroid shares one
+real kernel between guest and host), as a second path alongside the existing, still-correct
+`VCMD_ENCODE_RESOURCE` path for genuinely Venus-owned resources. See the main `README.md`'s Tier 7
+section and `DEVLOG.md`'s 2026-09-26 entries for the full reasoning.

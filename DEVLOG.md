@@ -1930,3 +1930,70 @@ into a second, fallback parsing path in `NvencEncComponent::process()`, exactly 
 then get an actual encoded frame out the other end. The diagnostic logging added this session should
 stay in the component (behind the existing `ALOGE` calls, not gated further) since it's cheap and
 was directly load-bearing for this exact investigation.
+
+## 2026-09-26 (same day, continued) — The handle-format question is solved; the real remaining blocker is one level deeper, and it's an architecture question, not a parsing bug
+
+Picked the handle-format question back up immediately. Cross-validated the empirical offsets from
+the previous entry against a *second* real capture at a different resolution
+(scrcpy's own `-m800` auto-retry, 450×800 instead of the native 720×1280) — the same four fixed
+offsets (stride, total size, width, height) tracked the *actual* new values correctly in both
+captures (`stride × height == total_size` held exactly for both: `3072×1280` and `2048×800`), and
+the format offset held the DRM fourcc `AB24` (`ABGR8888`) in both. This is strong, cross-checked
+confirmation, not a one-off coincidence — implemented a real fallback path in
+`NvencEncComponent::process()` (kept the original `cros_gralloc_handle_t` path first, for hand-built
+`C2Work` tests, which may still send genuine cros_gralloc handles; added the generic-wrapper path as
+a fallback when the size check fails), rebuilt (~17s), redeployed, retested.
+
+**The fallback parses cleanly — no more "isn't a cros_gralloc_handle" or "matches neither known
+layout" errors.** But the very next step, `vtest_encode_resolve_res_id()` (`DRM_IOCTL_PRIME_FD_TO_HANDLE`
+followed by `DRM_IOCTL_VIRTGPU_RESOURCE_INFO`, this component's own mechanism for turning a raw
+dma-buf fd into virglrenderer's Venus resource id), now fails: `DRM_IOCTL_VIRTGPU_RESOURCE_INFO
+failed: Out of memory`. `PRIME_FD_TO_HANDLE` itself succeeds fine (`bo_handle=1`, a normal-looking
+fresh GEM handle) — only the *virtgpu-specific* second ioctl fails.
+
+**Checked something that should have been checked before ever trusting this mechanism as general:
+what driver `/dev/dri/renderD128` actually is inside this container.** `cat
+/sys/class/drm/renderD128/device/uevent` → `DRIVER=nvidia`. This is the **real NVIDIA render node**,
+not a virtio-gpu kernel driver — there is no actual virtio-gpu kernel device anywhere in this
+container-based (not VM-based) architecture at all. `DRM_IOCTL_VIRTGPU_RESOURCE_INFO`'s ioctl number
+only means "give me this blob resource's virtio-gpu metadata" when sent to an *actual* virtio-gpu
+driver; sent to the real NVIDIA driver, it's just some ioctl number in NVIDIA's own command space —
+whatever it does there is incidental, not a real resource lookup. That the standalone
+`tests/tier7_vcmd_encode_resource_test.c` client got a real, working `res_id` back from this exact
+call sequence earlier in this project's history was real and reproducible, but only because *that*
+test's buffer was one this component's *own* allocation path (`nvidia_venus.c`'s
+`vtest_gpu_alloc_gpu()`) created in the first place — meaning something in that allocation flow
+leaves this exact ioctl answerable for buffers *it* made, not that the ioctl generically resolves
+any dma-buf's Venus identity.
+
+**The real, now well-understood shape of the remaining problem**: `scrcpy`'s actual capture buffer
+(from `GraphicBufferSource`'s virtual-display capture, the real production path any screen-recording
+app would use) is a genuine, importable dma-buf — `PRIME_FD_TO_HANDLE` proves that — but it was never
+allocated through this project's own Venus/`nvidia_venus.c` GPU-allocation path, so virglrenderer's
+host-side resource table has no entry for it at all. `virgl_renderer_resource_export_blob(res_id)`
+— the whole mechanism `VCMD_ENCODE_RESOURCE` is built on — fundamentally cannot reach a buffer that
+was never registered as a Venus resource in the first place, no matter how correctly its
+`native_handle_t` gets parsed. This isn't a bug to fix in the parsing code; it's confirmation that
+**this specific class of buffer needs a different transport than the one built so far.**
+
+The good news: this project doesn't actually need Venus/virtio-gpu's resource-id abstraction to move
+this fd at all. redroid runs guest and host on the *same real kernel* (containerization, not
+virtualization) — exactly the situation `redroid-hwenc`'s own VA-API daemon already solves, by
+passing the raw dma-buf fd directly from the Codec2 component to its host-side daemon over a plain
+Unix domain socket with `SCM_RIGHTS` (no Venus, no resource ids, no virtio-gpu anywhere in that
+path — it doesn't need any of that plumbing because the fd is already valid on the same kernel both
+sides share). This project's own `VCMD_ENCODE_RESOURCE` was the right tool for encoding a buffer
+Venus itself allocated (Tier 7's original spikes, all genuinely GPU-tiled/Venus-owned resources) —
+but for a plain, non-Venus dma-buf like this one, the daemon's simpler `SCM_RIGHTS` pattern is the
+correct mechanism, not a variant of the existing one.
+
+**Where this leaves Tier 7, precisely**: two working, understood transports for two different kinds
+of input, not one universal path — `VCMD_ENCODE_RESOURCE` for genuinely Venus-owned resources
+(proven, three real spikes deep), and a new, small `SCM_RIGHTS`-based listener (mirroring
+`redroid-hwenc`'s own already-working daemon code almost directly, since the underlying mechanism is
+identical) for plain dma-bufs like `GraphicBufferSource`'s capture buffer. The component's own
+`process()` needs to pick the right transport based on whether `vtest_encode_resolve_res_id()`
+actually finds a resource id (already distinguishable, since it returns 0 on failure) — falling back
+to the new socket path when it does. Not yet built - the next concrete, well-scoped step, with a
+working reference implementation to adapt sitting in the sibling project rather than needing to be
+invented from scratch.

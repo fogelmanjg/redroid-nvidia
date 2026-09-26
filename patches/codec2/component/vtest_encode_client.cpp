@@ -93,9 +93,12 @@ uint32_t vtest_encode_resolve_res_id(int render_node_fd, int dmabuf_fd) {
     struct drm_virtgpu_resource_info info = {};
     info.bo_handle = prime_handle.handle;
     if (drmIoctl(render_node_fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &info)) {
-        ALOGE("DRM_IOCTL_VIRTGPU_RESOURCE_INFO failed: %s", strerror(errno));
+        ALOGE("DRM_IOCTL_VIRTGPU_RESOURCE_INFO failed: %s (dmabuf_fd=%d bo_handle=%u)",
+              strerror(errno), dmabuf_fd, prime_handle.handle);
         return 0;
     }
+    ALOGE("DRM_IOCTL_VIRTGPU_RESOURCE_INFO ok: bo_handle=%u res_handle=%u size=%u blob_mem=%u",
+          prime_handle.handle, info.res_handle, info.size, info.blob_mem);
     return info.res_handle;
 }
 

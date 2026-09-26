@@ -523,13 +523,36 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       a prebuilt component with no local source). See DEVLOG's 2026-09-26 entry for the full
       byte-level detail and the four deployment bugs' exact fixes.
 
-      **What's left, cleanly scoped for the next session**: turn this session's raw byte capture
-      into a second, fallback parsing path in `NvencEncComponent::process()` — exactly mirroring how
-      `VaapiEncComponent` itself grew a non-cros_gralloc fallback for its own equivalent discovery —
-      then get an actual encoded frame out the other end, closing Tier 7 completely and, if the
-      theory holds, eliminating the earlier session's observed software-encoder corruption entirely
-      by construction (NVENC never reads the tiled surface through the CPU at all). See
-      [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
+      **Same day, continued — the handle-format question solved, and a deeper, architectural
+      question found underneath it.** Cross-validated the empirical offsets against a *second* real
+      capture at a different resolution (450×800, from scrcpy's own auto-retry) — the same four
+      fixed offsets correctly tracked the new width/height/stride/format, `stride × height`
+      reproducing the reported total size exactly both times. Implemented the fallback parsing path
+      in `NvencEncComponent::process()`, confirmed it parses real captures cleanly with no more
+      "unknown handle" errors. But the *next* step — resolving the buffer's Venus resource id via
+      `DRM_IOCTL_PRIME_FD_TO_HANDLE`/`DRM_IOCTL_VIRTGPU_RESOURCE_INFO` — now fails with `Out of
+      memory`, traced to something more fundamental than a bug: `/dev/dri/renderD128` inside this
+      container is confirmed (`DRIVER=nvidia` in its own `uevent`) to be the **real NVIDIA render
+      node**, not a virtio-gpu kernel device — there is no actual virtio-gpu driver anywhere in this
+      container-based architecture. The standalone test that once "confirmed" this exact resolution
+      mechanism only worked because *that* test's buffer was allocated by this project's *own* Venus
+      GPU-allocation path in the first place; `scrcpy`'s real capture buffer (from
+      `GraphicBufferSource`) is a genuine, importable dma-buf that was simply never allocated that
+      way, so virglrenderer's host-side resource table has no entry for it — no amount of correct
+      parsing can produce a resource id for a resource that was never registered as one.
+      `VCMD_ENCODE_RESOURCE` remains the right, proven mechanism for encoding a buffer Venus itself
+      allocated (three real spikes deep); a plain dma-buf like this one needs a different transport
+      — and redroid-hwenc's own VA-API daemon already has one, proven and working: since redroid
+      shares one real kernel between guest and host, a dma-buf fd can move directly over a plain
+      Unix domain socket with `SCM_RIGHTS`, no Venus/resource-id abstraction needed at all.
+
+      **What's left, cleanly scoped for the next session**: a new, small `SCM_RIGHTS`-based listener
+      (adapting redroid-hwenc's own already-working daemon code almost directly — the underlying
+      mechanism is identical), with `NvencEncComponent::process()` picking the right transport based
+      on whether `vtest_encode_resolve_res_id()` finds a real resource id or not. Once that's in
+      place, closing Tier 7 completely — and, if the theory holds, eliminating the earlier session's
+      observed software-encoder corruption entirely by construction — is the next real checkpoint.
+      See [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
       external to the repo) for the host-prerequisite checklist this session re-applied after a
       clean reboot.
 
