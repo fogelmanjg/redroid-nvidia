@@ -304,20 +304,23 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       pattern) that this may be substantially an Ada Lovelace / recent-driver-specific issue
       rather than something reachable purely from this project's own guest or host code - see
       Tier 7's own entry below for the fuller cross-hardware investigation this comes from.
-- [x] **Tier 6 — Hardware video decode. Standalone mechanism proven bit-exact (2026-09-27), as
-      shared work in [redroid-hwenc](https://github.com/fogelmanjg/redroid-hwenc) rather than
-      duplicated here.** `nvidia-vaapi-driver` provides real VA-API decode (`VAEntrypointVLD`,
-      confirmed via `vainfo`) - unlike encode, this doesn't need a vendor-specific transport at
-      all, since decode is the same VA-API mechanism redroid-hwenc's own encode daemon already
-      speaks for AMD/Intel; NVIDIA is just a fourth GPU for it, not a fork. That repo's standalone
-      spike (`tier6-vaapi-decode/main.c`) decodes a real IDR frame via actual NVDEC hardware with
-      output confirmed **byte-for-byte identical** to software decode (`ffmpeg`'s own PSNR filter:
-      `y:inf u:inf v:inf`). Six real bugs found and fixed there, none specific to this project's
-      own guest/host code - see that repo's DEVLOG 2026-09-27 entries for the full trail. What's
-      left is the same piece regardless of which project ends up hosting it: folding the daemon
-      side into `tier5-vaapi-daemon`'s existing multi-vendor architecture, then the Codec2-side
-      decoder component itself (input=compressed bitstream, output=decoded frame) - genuinely new
-      work, since neither project has a hardware *decoder* component yet, only encoders.
+- [x] **Tier 6 — Hardware video decode. Closed by reference (2026-09-27): fully integrated and
+      proven end to end as shared work in [redroid-hwenc](https://github.com/fogelmanjg/redroid-hwenc)
+      rather than duplicated here.** `nvidia-vaapi-driver` provides real VA-API decode
+      (`VAEntrypointVLD`, confirmed via `vainfo`) - unlike encode, this doesn't need a
+      vendor-specific transport at all, since decode is the same VA-API mechanism redroid-hwenc's
+      own daemon already speaks for AMD/Intel encode; NVIDIA is just a fourth GPU for it, not a
+      fork. That repo's standalone spike (`tier6-vaapi-decode/main.c`) first decoded a real IDR
+      frame via actual NVDEC hardware **byte-for-byte identical** to software decode (`ffmpeg`'s
+      own PSNR filter: `y:inf u:inf v:inf`), then, same day, got folded all the way into the real
+      stack: `tier5-vaapi-daemon` now dispatches encode and decode as two independent backends on
+      one socket, and `c2.hardware.decoder.h264` (`VaapiDecComponent`) is a real Codec2 component,
+      the structural mirror of the existing encoder. Verified on two real hosts in one session - a
+      decode-only NVIDIA GPU (bit-exact decode through the real daemon socket protocol) and an
+      encode-only AMD GPU (confirming the new dispatch tag doesn't disturb the existing encode wire
+      format) - none of it specific to this project's own guest/host code. See that repo's DEVLOG
+      2026-09-27 entries for the full trail. What's left there is the real-device test (driving the
+      component through the genuine `MediaCodec` path), not anything blocking this project.
 - [ ] **Tier 7 — ⭐ Hardware video encode (NVENC). Correct, recognizable output confirmed on
       real hardware; one open item left, and it's a driver limitation, not this project's bug.**
       Structurally similar to what redroid-hwenc solved for VA-API
