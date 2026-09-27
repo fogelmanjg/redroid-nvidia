@@ -12,24 +12,38 @@ on both vendors. That project could start from a real foundation: `gpuMode=host`
 rendering via Mesa) already works on AMD/Intel, so the work was specifically about wiring hardware
 *encode* on top of that.
 
-NVIDIA doesn't have that foundation yet. As of today:
+NVIDIA didn't have that foundation when this project started. At that point:
 
-- **`gpuMode=host` doesn't boot on NVIDIA.** With driver capabilities correctly set (see below),
-  `gralloc.redroid.so` (Mesa's GBM, built against Android's bionic libc) genuinely runs but fails
+- **`gpuMode=host` didn't boot on NVIDIA.** With driver capabilities correctly set (see below),
+  `gralloc.redroid.so` (Mesa's GBM, built against Android's bionic libc) genuinely ran but failed
   at `gbm_create_device()` with `EINVAL` — it has no driver-table entry for NVIDIA's proprietary
   stack, only for `nouveau`. A real cross-libc/cross-namespace wall, not a config gap — see the
-  findings below and the roadmap's Tier 0/1.
+  findings below and the roadmap's Tier 0/1. **Still true today** — nothing patches this native
+  path directly — but see "Current status" below for the different path this project built instead.
 - **`gpuMode=guest` (pure software rendering) does work** as a fallback — confirmed booting clean
   in ~14s — but that's no acceleration at all, not a fix.
 - **Hardware video encode can't reuse redroid-hwenc's approach at all.** `nvidia-vaapi-driver` is
   **decode-only** — `vainfo` lists plenty of decode profiles and zero `VAEntrypointEncSlice`
   entries. NVIDIA's real hardware encoder (NVENC) is exposed through NVIDIA's own proprietary API,
-  not VA-API. Whatever solves encode here will need a genuinely different backend from
+  not VA-API. Whatever solves encode here needs a genuinely different backend from
   redroid-hwenc's VA-API daemon, not a port of it.
 
 So: two real, separate gaps (3D acceleration, then encode), and the first one is the actual
 prerequisite for almost everything else — including hardware video *decode* inside apps, not just
 encode.
+
+## Current status
+
+Both gaps have a **working solution today**, through a different mechanism than the native path
+above (see the roadmap for the full trail): a custom Venus-proxy pipeline
+(guest Mesa Venus → a host-side `virglrenderer` process → real Vulkan/NVENC against the real
+driver) confirmed booting to a real, rendered Android home screen with real GPU acceleration, and
+real hardware video encode via NVENC producing correct, decodable H.264 — both confirmed on **two**
+real GPUs (GTX 1050 Ti, RTX 4060). Hardware video *decode* turned out not to need any of this: it's
+the same VA-API mechanism [redroid-hwenc](https://github.com/fogelmanjg/redroid-hwenc)'s own daemon
+already speaks for AMD/Intel, folded in there instead of duplicated here (Tier 6 below). One open
+item remains, isolated to a real driver-level limitation on the RTX 4060 specifically (Tier 7's own
+entry has the detail) — not a blocker for the 1050 Ti, and not a flaw in this project's own code.
 
 ## What's already been ruled out or confirmed
 
@@ -777,8 +791,10 @@ public, document the real process — including the dead ends — as it happens.
 ## Contributing
 
 Same as redroid-hwenc: no CLA, no friction, plain Apache-2.0. If you've got NVIDIA hardware and
-want to help chase the `gpuMode=host` boot crash, or you've solved a piece of this already, a PR
-or an issue comment is worth more than asking for permission first.
+want to help — more GPU generations/driver versions for the compatibility table, chasing the RTX
+4060's remaining driver-level artifact, or even the native `gpuMode=host` boot crash this project
+ended up routing around instead of fixing directly — a PR or an issue comment is worth more than
+asking for permission first.
 
 ## License
 
