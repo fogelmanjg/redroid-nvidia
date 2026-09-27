@@ -304,9 +304,20 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       pattern) that this may be substantially an Ada Lovelace / recent-driver-specific issue
       rather than something reachable purely from this project's own guest or host code - see
       Tier 7's own entry below for the fuller cross-hardware investigation this comes from.
-- [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
-      `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
-      been investigated at all yet in this context.
+- [ ] **Tier 6 — Hardware video decode. In progress, as of 2026-09-27 being built as shared work
+      in [redroid-hwenc](https://github.com/fogelmanjg/redroid-hwenc) rather than duplicated
+      here.** `nvidia-vaapi-driver` provides real VA-API decode (`VAEntrypointVLD`, confirmed via
+      `vainfo`) - unlike encode, this doesn't need a vendor-specific transport at all, since
+      decode is the same VA-API mechanism redroid-hwenc's own encode daemon already speaks for
+      AMD/Intel; NVIDIA is just a fourth GPU for it, not a fork. A standalone spike
+      (`tier6-vaapi-decode/main.c` in that repo) already decodes a real IDR frame via actual NVDEC
+      hardware with pixel-perfect luma (confirmed via PSNR against software decode); chroma is a
+      remaining, isolated, understood issue. See that repo's own DEVLOG 2026-09-27 entry for the
+      full trail. Once the daemon side is folded into `tier5-vaapi-daemon`'s existing multi-vendor
+      architecture, this tier closes by reference rather than needing its own separate
+      implementation - the Codec2-side wiring (a decoder component, input=compressed bitstream,
+      output=decoded frame) is the piece still specific to whichever project's guest side ends up
+      hosting it.
 - [ ] **Tier 7 — ⭐ Hardware video encode (NVENC). Correct, recognizable output confirmed on
       real hardware; one open item left, and it's a driver limitation, not this project's bug.**
       Structurally similar to what redroid-hwenc solved for VA-API
