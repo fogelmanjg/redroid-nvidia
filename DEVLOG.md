@@ -2490,3 +2490,104 @@ scattered dropout - not the earlier checkerboard/shear corruption, both of which
 this project's own code and are now fixed) and that it doesn't reproduce on other supported hardware,
 it's reasonable to document and accept it rather than keep chasing a fix that depends on NVIDIA's own
 driver team.
+
+## 2026-09-27 (same day, continued) — RTX 4060 retested on driver 580.105.08: a different, worse crash, confirmed as a known, still-open NVIDIA driver bug, independent of driver version
+
+`jgustavo48` came back up on driver **580.105.08** (the same driver already confirmed clean on the
+GTX 1050 Ti) after an unrelated driver-troubleshooting session outside this project - worth retesting
+before assuming the RTX 4060's own open item from the previous entry (the 595.91.07-specific "prime
+fence" scanline dropout) was still the right framing.
+
+**Fresh-boot host prerequisites, again**: `jgustavo48` hit the exact same class of post-reboot gap
+`reference_redroid_host_prerequisites_debian_btrfs` already documented for `jgustavo46` - `loop`/
+`ext4` kernel modules not loaded, and (worse) Docker had already auto-created `/dev/binder`,
+`/dev/hwbinder`, `/dev/vndbinder`, and **all 64** `/dev/loop0`-`/dev/loop63` as empty host-side
+directories (Docker's own behavior when a bind-mount source doesn't exist yet at container-start
+time) - so simply `modprobe`-ing the modules afterward couldn't create the real device nodes in
+their place. Fixed by `rmdir`-ing every leftover directory first, then `modprobe binder_linux
+devices=binder,hwbinder,vndbinder` / `modprobe loop max_loop=64` / `modprobe ext4`, `chmod 0666` on
+the binder nodes. Worth promoting to persistent `/etc/modules-load.d/` + `/etc/modprobe.d/` config
+on `jgustavo48` (as the reference doc already recommends) so this stops being a manual step after
+every reboot - not yet done.
+
+**With the container actually booting, real GPU acceleration confirmed working again on this
+GPU/driver combination** (ANGLE reported real Vulkan 1.3 via Venus against the RTX 4060, matching
+Tier 4's own original finding) - and separately, the user connected directly to the host's own
+desktop session via Moonlight and confirmed normal, full 3D-accelerated desktop use with no issues
+at all on 580.105.08, ruling out a host-level driver problem before even touching redroid.
+
+**scrcpy crashed the guest outright** - not the scanline artifact this time, something worse: full
+`system_server`/`surfaceflinger` death (`DeadSystemException` spamming every input event scrcpy's
+control channel tried to inject). `logcat -b crash` pinned the real fault: a `SIGABRT` in
+`surfaceflinger`'s own `RenderEngine` thread, `abort` <- `vn_ring_submit_locked` <-
+`vn_GetPhysicalDeviceFormatProperties2` <- `vn_GetAndroidHardwareBufferPropertiesANDROID` <- Skia's
+`GetAHardwareBufferProperties`/`MakeVulkanBackendTexture` <- `GaneshBackendTexture` <-
+`mapExternalTextureBuffer` - **the identical stack already documented in the 2026-09-26 session**
+("Same day, continued live with the user directly connected"), which had been provisionally
+attributed to something specific about driver 595.91.07. It is not: same crash, same stack, now
+confirmed on 580.105.08 too. That earlier attribution was wrong - this is not tied to one specific
+driver build.
+
+**Ruled out image and host-software drift as variables, cleanly**: pulled the exact
+`redroid-nvenc-snapshot:latest` image already confirmed clean on the GTX 1050 Ti (same image ID,
+`ed068da1e0b7`, present on both hosts) and booted a fresh container from it on `jgustavo48` with the
+identical bind-mount set `jg-nvenc` used - same crash. Checksummed the host-side
+`libvirglrenderer.so.1` (the component that actually implements the Venus/Vulkan translation this
+crash lives inside) on both machines: **byte-identical** (`08b90e9a...`). Guest image, host Venus
+library, and driver version are now all confirmed identical between a machine where this works and
+one where it doesn't - the only remaining variable is the physical GPU itself.
+
+**Root-caused one level deeper than the guest-side abort, via `dmesg`**: at the exact moment of the
+crash, the host kernel logs a real NVIDIA driver-internal assertion failure, not just a Vulkan
+validation error:
+```
+NVRM: nvAssertFailedNoLog: Assertion failed: vaHi <= pMemBlock->end @ gpu_vaspace.c:2227
+NVRM: nvCheckFailedNoLog: Check failed: NV_OK == status @ virt_mem_allocator_gm107.c:2606
+NVRM: dmaAllocMapping_GM107: can't update VA space for mapping @vaddr=0xdf7c800000
+```
+This is NVIDIA's own proprietary kernel driver failing to satisfy a GPU virtual-address-space mapping
+request it made to itself - genuinely upstream of anything Venus, Mesa, or this project's own guest
+image could be responsible for. The host-side `virgl_render_server` log corroborates it from the
+Vulkan API's own vantage point: `vkQueueSubmit resulted in CS error` / `ring_submit_cmd:
+vn_dispatch_command failed`, i.e. a real command-stream rejection, not a benign validation warning.
+
+**This exact assertion signature is a known, currently-open NVIDIA driver bug**, not something
+specific to this project's own usage pattern - confirmed via NVIDIA's own `open-gpu-kernel-modules`
+GitHub repo and developer forums:
+- [Issue #1364](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1364) (driver 610.57.04,
+  GA102) and [#1165](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1165) (GTX 1650,
+  `virt_mem_allocator_gm107.c`) - both open, no NVIDIA-provided fix, reporters explicitly ruled out
+  IOMMU/PCIe topology/thermal/VRAM exhaustion as causes without finding the real one.
+- [Issue #1140](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1140) (RTX 4090) and
+  [#1396](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1396) describe the same
+  `dmaAllocMapping_GM107` failure mode as **BAR1 virtual-address-space exhaustion**, and an NVIDIA
+  employee confirmed on the
+  [developer forum thread](https://forums.developer.nvidia.com/t/bug-report-wayland-only-dmaallocmapping-gm107-va-mapping-failures-does-not-reproduce-on-x11/353598)
+  for this exact error signature that "issue doesn't persist once we enable resizable bar option in
+  BIOS" - multiple users on RTX 3080/3090/4070 Ti/5070 Ti and even a GTX 1060 confirmed the same fix.
+- **That fix does not apply here**: checked `lspci -vv` on `jgustavo48` and BAR1 is already resized
+  to its maximum, `8GB` (`Capabilities: Physical Resizable BAR` shows `current size: 8GB, supported:
+  ... 8GB`) - the full VRAM size, not the default 256MB the reported cases started from. The known
+  public workaround for this bug class is already applied and doesn't help in this case.
+- Confirmed this is affects multiple GPU generations in the wild (not Ada-specific) and multiple
+  driver branches (595.71.05 through 610.57.04, now also 580.105.08 here) - it's a real, unresolved
+  gap in NVIDIA's own VA-space/DMA-mapping allocator, tracked internally by NVIDIA (referenced
+  internal ticket #5762513 in one issue) but with no public fix or alternate workaround documented
+  anywhere found.
+- Checked the open-source `nv-reg.h`/`nvrm_registry.h` registry-key headers directly for any
+  undocumented tunable that could restrict GPU VA-space allocations to a smaller range (the user's
+  own hypothesis: the 1050 Ti's 4GB VRAM vs. the 4060's 8GB likely changes the allocator's internal
+  layout enough to dodge the bug by accident). Found one superficially-matching key,
+  `RMRestrictVARange` ("Restrict the VA range to be <= VASPACE_SIZE_FERMI") - not applicable: it's a
+  legacy Fermi-era compatibility knob for GPUs with mixed 49-bit/non-49-bit VA support across engine
+  blocks, a fixed constant unrelated to installed VRAM size, and not confirmed settable through the
+  standard `NVreg_RegistryDwords` interface on a modern driver. Not attempted.
+
+**Decision**: try NVIDIA driver branch 590 next (the candidate already identified in the previous
+entry, still untested) rather than chase either the ReBAR angle (already maxed, doesn't help) or the
+`RMRestrictVARange` angle (wrong knob, real risk of destabilizing unrelated GPU engines for an
+unconfirmed payoff). Given driver-branch experiments on this specific bug are expected to potentially
+hang the machine outright (this bug class already causes full GPU/system lockups in the linked
+reports, not just an app crash), the user is adding a 220V WiFi power switch to `jgustavo48` (matching
+the existing setup on `jgustavo-server01` and `jgustavo46`) before continuing, specifically so a
+hung GPU/driver state can be power-cycled remotely rather than needing physical access.
