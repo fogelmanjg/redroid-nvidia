@@ -296,11 +296,20 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       it may make Tier 5's fix unnecessary by construction rather than needing it as a
       prerequisite. `screencap`/any genuine CPU pixel read still needs Tier 5's fix regardless,
       but that's no longer the critical path. See DEVLOG's 2026-09-25 entries for the full trail.
+      **Cross-hardware data point (2026-09-27): this exact corruption does not reproduce on a
+      GTX 1050 Ti (Pascal, driver 580.105.08)** - same container, same code, a plain `screencap`
+      comes back completely clean (no 64-byte-grid corruption at all). Doesn't identify which
+      specific link in the OPTIMAL/Skia chain above is GPU-generation-dependent, but is a real,
+      concrete signal alongside Tier 7's own equivalent finding (same two machines, same result
+      pattern) that this may be substantially an Ada Lovelace / recent-driver-specific issue
+      rather than something reachable purely from this project's own guest or host code - see
+      Tier 7's own entry below for the fuller cross-hardware investigation this comes from.
 - [ ] **Tier 6 — Hardware video decode.** Should become reachable once Tier 5 is solid —
       `nvidia-vaapi-driver` already provides VA-API decode; the Codec2 side of that story hasn't
       been investigated at all yet in this context.
-- [ ] **Tier 7 — ⭐ Hardware video encode (NVENC). In progress: the make-or-break spike is
-      confirmed on real hardware.** Structurally similar to what redroid-hwenc solved for VA-API
+- [ ] **Tier 7 — ⭐ Hardware video encode (NVENC). Correct, recognizable output confirmed on
+      real hardware; one open item left, and it's a driver limitation, not this project's bug.**
+      Structurally similar to what redroid-hwenc solved for VA-API
       (a host-side daemon the Codec2 component talks to), but the exact transport differs: NVENC
       is driven through CUDA's external-memory interop, not a plain VA-API dma-buf import, and the
       real question was whether that interop tolerates the *same* dma-buf minigbm's
@@ -680,6 +689,65 @@ happens, bugs and dead ends included. ⭐ marks the highest-leverage checkpoint.
       [`reference_jgustavo48_redroid_host_prerequisites`] (this project's own working memory,
       external to the repo) for the host-prerequisite checklist this session re-applied after a
       clean reboot.
+
+      **The checkerboard/shear corruption above: root-caused and fixed (2026-09-26, later the
+      same day).** Four real, independent bugs, found by direct evidence rather than theory after
+      two plausible-but-ineffective fixes: (1) the modifier-discovery helper picked the first of
+      six real non-linear tiling candidates this GPU exposes per format, with no basis for
+      picking the *correct* one - fixed by probing a real image and reading back the driver's
+      actual choice. (2) The explicit dma-buf import's row pitch used the sender's plain gralloc
+      stride directly, invalid for a non-linear modifier - fixed by probing the real layout too.
+      (3) The buffer's real allocated width can differ from the display width Codec2 reports
+      (confirmed: stride implied 768px for a 720-wide frame) - every image was created at the
+      wrong width. **The actual root cause**: a real `GraphicBufferSource` capture buffer on this
+      stack genuinely is `DRM_FORMAT_MOD_LINEAR` (confirmed by `mmap()`-ing the raw dma-buf
+      directly and rendering it as plain linear RGBA - the real home screen came out immediately)
+      - the daemon was overriding this correctly-reported value with a guessed non-linear
+      modifier on every single frame. (4) A second bug surfaced once the first was fixed:
+      `copy_image` (NVENC's own persistent CUDA-array-registered surface) was forced onto the
+      *source's* modifier too, so a linear source silently forced `copy_image` linear as well,
+      even though its own ideal layout is an independent question. Fixing both together produced
+      a correctly positioned, correctly colored Android home screen decoded from real NVENC
+      hardware output - search bar, wallpaper, every icon exactly where it belongs. A fifth bug
+      (R/B channel swap, `copy_image`'s NVENC `bufferFormat` hardcoded regardless of the source's
+      real channel order) was found and fixed the same way shortly after.
+
+      **What's left, and why it's now a driver question, not a code question (2026-09-26/27,
+      cross-machine investigation):** a real, low-severity scanline dropout artifact remains,
+      already present in the raw, unprocessed source bytes (confirmed via the same `mmap()` dump
+      above) - i.e. upstream of this project's own pipeline entirely. Re-tested
+      `block.fence().wait()` a second time with proper logging after the fixes above, in case one
+      of them had been the real cause of its earlier "fails at the driver level" observation: it
+      hadn't. Confirmed via `C2Fence`'s actual source that this is already the most generic
+      fence-wait mechanism available - a plain `sync_wait()` on the fence's own fd, no Vulkan/EGL/
+      CUDA-specific import involved - so it returns `C2_OK` while the kernel logs
+      `nv_drm_prime_fence_context_create_ioctl: Failed to import fence semaphore surface`
+      underneath it, failing open rather than actually blocking. **The bigger finding**: that same
+      kernel error fires continuously (~every 100ms, a composition/vsync cadence) with this
+      project's own fence-wait code removed entirely - i.e. it isn't specific to this encode path
+      at all. Android's own compositor already hits this same NVIDIA driver limitation on its own,
+      independent of NVENC or even `scrcpy` running. **Cross-machine confirmation**: transferred
+      the exact same container (a `docker commit` snapshot, byte-identical Android userland) to a
+      second machine with a GTX 1050 Ti (Pascal, driver 580.105.08) - both the software encoder
+      and NVENC come back completely clean there, no scanline dropout, no color swap, and the same
+      kernel error signature never occurs at all, confirmed via the same compositor-idle test.
+      Tier 5's own corruption doesn't reproduce there either (see Tier 5's entry above). This is a
+      real, systemic gap in driver 595.91.07's support for importing a "prime fence" across this
+      project's own guest/host-shared-kernel usage pattern on Ada Lovelace specifically - not
+      reachable from userspace on the guest side at all (Vulkan, EGL, CUDA all need the identical
+      kernel primitive), and not a flaw in this project's own code, since the identical code and
+      container are clean on different hardware. Attempted the exact same 580.105.08 driver on the
+      RTX 4060 itself to isolate driver-version from GPU-generation as the variable: its kernel
+      module doesn't even build against a slightly newer point-release kernel
+      (`pci_resize_resource` gained a parameter upstream); building it against the exact kernel
+      version that does compile it triggered a real hardware hang (unresponsive, fans at 100%,
+      needed a physical power cycle) on load, and even after a clean cold boot, `RmInitAdapter`
+      fails outright - this specific driver's own firmware package genuinely ships no GSP firmware
+      for Ada Lovelace at all (`ls firmware/` shows `gsp_tu10x.bin`/`gsp_ga10x.bin` only, verified
+      by extracting the installer directly), independent of the kernel API issue. 580.105.08 is
+      conclusively not viable on this GPU; next candidate is driver branch 590 (the closest branch
+      NVIDIA's own repo packages for this Debian target), not yet attempted. See DEVLOG's
+      2026-09-26/27 entries for the full trail.
 
 Even if it doesn't go further, each tier on its own is a publishable contribution.
 
