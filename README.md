@@ -38,6 +38,15 @@ AMD/Intel, folded in there instead of duplicated here (Tier 6 below). One open i
 isolated to a real driver-level limitation on the RTX 4060 specifically (Tier 7 below) — not a
 blocker for the 1050 Ti, and not a flaw in this project's own code.
 
+**Re-validated end to end, live, 2026-11-09** (after the guest artifacts had to be rebuilt from
+scratch — see DEVLOG): both GPUs boot `gpuMode: host` clean through `redroid-forge`'s `nvenc` +
+`venus3d` modules together, with real Vulkan rendering and real NVENC encode confirmed live on
+each. The RTX 4060's Tier 5 texture artifact still reproduces, but watched live over an actual
+session rather than inferred from a game's automated screens, it is **rare and self-resolves
+within a couple of frames** — milder than the original description below suggested. A new,
+separate, unrelated finding from the same session: Opus audio encode doesn't register at all in
+this exact module combination (AAC/FLAC still do) — not yet root-caused, see DEVLOG.
+
 ## Pre-existing footguns (worth checking before you start)
 
 Found during initial investigation, independent of the GPU-acceleration work itself:
@@ -75,8 +84,8 @@ Even if it doesn't go further, each tier on its own is a publishable contributio
 
 | GPU | Architecture | 3D accel (Tier 4/5) | NVENC encode (Tier 7) | Notes |
 |---|---|---|---|---|
-| GTX 1050 Ti | Pascal | Boots, renders | Correct, clean | Reference for "clean" — neither Tier 5's corruption nor Tier 7's driver artifact reproduce here. |
-| RTX 4060 | Ada Lovelace | Boots, renders (Tier 5's corruption present) | Correct, one open artifact | Both open items are the *same* underlying driver limitation (driver 595.91.07's "prime fence" import) — see Tier 5/7 above. |
+| GTX 1050 Ti | Pascal | Boots, renders | Correct, clean | Reference for "clean" — neither Tier 5's corruption nor Tier 7's driver artifact reproduce here. Re-confirmed live 2026-11-09. |
+| RTX 4060 | Ada Lovelace | Boots, renders (Tier 5's corruption present) | Correct, one open artifact | Both open items are the *same* underlying driver limitation (driver 595.91.07's "prime fence" import) — see Tier 5/7 above. Re-confirmed live 2026-11-09: still present, but rare and self-resolving within a couple of frames in real use — milder than it reads below. |
 
 ## Why a separate repo
 
