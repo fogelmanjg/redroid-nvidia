@@ -2591,3 +2591,53 @@ hang the machine outright (this bug class already causes full GPU/system lockups
 reports, not just an app crash), the user is adding a 220V WiFi power switch to `jgustavo48` (matching
 the existing setup on `jgustavo-server01` and `jgustavo46`) before continuing, specifically so a
 hung GPU/driver state can be power-cycled remotely rather than needing physical access.
+
+## 2026-11-09 — venus3d guest artifacts lost and rebuilt; host+nvenc+venus3d re-validated end to end on both GPUs
+
+The `REDROID_VENUS3D_ARTIFACTS_DIR` guest-side build (`vulkan.virtio.so` ×2 ABIs,
+`libminigbm_gralloc.so`/`gralloc.minigbm.so` ×2 ABIs, ANGLE, libdrm/libdmabufheap) turned out to
+exist nowhere durable — not on the live fleet hosts, not as a GitHub release here, not in the 4TB
+SATA backup (which only had an unrelated, unpatched AOSP snapshot). Rebuilt clean from the current,
+already-patched `aosp-redroid-15` tree on `jgustavo-server01` (`m gralloc.minigbm` via Soong for the
+gralloc side, a standalone meson+NDK cross-build against this tree's own patched Mesa source for
+`vulkan.virtio.so`, following `build/mesa/build.sh`) — confirmed real (not stock/stub) via the known
+patch-marker strings (`REDROID-DIAG`, `nvidia-drm`/`nvidia_venus`/`backend_nvidia_venus`). The
+host-side daemon (`virgl_test_server` + `virgl_render_server` + `libvirglrenderer.so.1`) was never
+actually lost — found intact at `/opt/redroid-forge/venus3d-daemon/` on both `jgustavo47` and
+`jgustavo48`, left there from the 2026-11-01 session referenced above.
+
+**Published as [`v1.0.0`](https://github.com/fogelmanjg/redroid-nvidia/releases/tag/v1.0.0)** so this
+doesn't have to be rebuilt from scratch again: the guest artifacts tarball, the host daemon binaries,
+and a license-attribution `NOTICE.md` (Mesa MIT, minigbm BSD-3-Clause, ANGLE BSD-3-Clause, AOSP
+libdrm/libdmabufheap MIT/Apache-2.0 — all redistributable per `redroid-forge`'s own
+`docs/REQUIREMENTS.md` §6 license policy).
+
+With the artifacts back, re-ran the full `gpuMode: host` + `nvenc` + `venus3d` combination end to end
+on both machines (redroid-forge, `android-15-official` base):
+
+- **Confirmed `venus3d` is load-bearing for `gpuMode: host` on NVIDIA, not optional**: a `host`-mode
+  instance with only `nvenc` (no `venus3d`) crash-loops `surfaceflinger` forever (`SIGABRT`, `'no
+  suitable EGLConfig found, giving up'` in `SkiaGLRenderEngine`) — `gralloc.redroid.so`'s Mesa/GBM
+  path has no NVIDIA entry, so RenderEngine can never initialize. This is this project's module
+  design working as intended, not a new bug; it was a gap in the first re-test attempt, not in the
+  code.
+- **GTX 1050 Ti (`jgustavo47`)**: clean end to end — `surfaceflinger` boots, `dumpsys SurfaceFlinger`
+  shows a real Vulkan device (`Vulkan device initialized: 1`), `NvencEncComponent` encodes real
+  frames (confirmed live in logcat), user watched it over scrcpy and called it done, no issues.
+- **RTX 4060 (`jgustavo48`)**: same clean boot and the same real Vulkan/NVENC confirmed live
+  (`app_process`/scrcpy-server running on-device, fresh `NvencEncComponent` log lines seconds old).
+  The known texture/tiling issue from the 2026-11-01 entry above still reproduces, but — watched live
+  today rather than inferred from a game's automated screens — the user describes it as **rare and
+  self-resolving within a couple of frames**, mildly noticeable only on screens with large sharp
+  black/white contrast areas. Downgrading how this gets described from "known issue" (implying
+  something closer to the `virgl_test_server --venus` crash documented above) to a minor, transient,
+  non-blocking visual artifact — the project's own public compatibility claims (`redroid-forge`
+  README) were more cautious about this than today's direct hands-on testing supports.
+
+No root-cause work done on the tiling artifact itself this session (unlike the crash above, which
+got the deep kernel-log/driver-bug treatment) — deferred. Opus (audio) encode also broke
+specifically in this `nvenc`+`venus3d` combination (`c2.android.opus.encoder` doesn't register even
+though the `ro.boot.use_redroid_c2=1` boot flag and `debug.stagefright.ccodec=4` are both correctly
+set, and manually restarting `mediaswcodec` doesn't fix it either) — a new, real, unresolved finding,
+also deferred; AAC/FLAC still work, so audio isn't silently broken, just not Opus specifically in
+this combination.
